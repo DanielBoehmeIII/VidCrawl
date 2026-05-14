@@ -7,6 +7,13 @@ from vidcrawl.config import Config
 
 class NoTranscriptAvailableError(Exception):
     """Raised in caption-only mode when no transcript source is available."""
+
+
+class NeedsTranscriptionError(Exception):
+    """Raised when captions are unavailable and allow_whisper=False.
+
+    The caller may retry with allow_whisper=True to trigger Whisper ASR.
+    """
 from vidcrawl.db import (
     complete_ingestion_run,
     generate_evidence_id,
@@ -56,6 +63,7 @@ def process_local_video(
     source_url: Optional[str] = None,
     video_id_override: Optional[str] = None,
     raise_on_no_transcript: bool = False,
+    preloaded_transcript: Optional[list[dict]] = None,
 ) -> str:
     path = Path(video_path).resolve()
     video_id = video_id_override or make_video_id("local", str(path))
@@ -122,6 +130,7 @@ def process_local_video(
                 caption_timeout_sec=caption_timeout_sec,
                 source_url=source_url,
                 raise_on_no_transcript=raise_on_no_transcript,
+                preloaded_transcript=preloaded_transcript,
             )
         except NoTranscriptAvailableError:
             update_video_status(conn, video_id, "pending")
@@ -135,6 +144,27 @@ def process_local_video(
             raise
 
     return video_id
+
+
+def _load_whisper_cache(transcripts_dir: Path, video_id: str) -> Optional[list[dict]]:
+    cache_path = transcripts_dir / f"{video_id}_whisper.json"
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def _save_whisper_cache(transcripts_dir: Path, video_id: str, segments: list[dict]) -> None:
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = transcripts_dir / f"{video_id}_whisper.json"
+    try:
+        with open(cache_path, "w") as f:
+            json.dump(segments, f)
+    except Exception:
+        pass
 
 
 def _run_pipeline(
@@ -152,39 +182,58 @@ def _run_pipeline(
     caption_timeout_sec: float = 60.0,
     source_url: Optional[str] = None,
     raise_on_no_transcript: bool = False,
+    preloaded_transcript: Optional[list[dict]] = None,
 ) -> None:
     video_id = video.video_id
 
-    transcript_entries = load_sidecar_transcript(str(video_path))
-    if transcript_entries is not None:
-        steps.append("load_transcript")
-        print(f"  [transcript] Loaded sidecar ({len(transcript_entries)} segments).", flush=True)
+    if preloaded_transcript is not None:
+        transcript_entries: Optional[list[dict]] = preloaded_transcript
+        steps.append("preloaded_transcript")
+        print(
+            f"  [transcript] Using preloaded transcript ({len(preloaded_transcript)} segments).",
+            flush=True,
+        )
     else:
-        yt_url = source_url or (video.url if video.source == "youtube" else None)
-        if prefer_yt_captions and yt_url:
-            print("  [captions] Fetching YouTube captions...", flush=True)
-            transcript_entries = fetch_youtube_captions(yt_url, timeout_sec=caption_timeout_sec)
-            if transcript_entries:
-                steps.append("yt_captions")
-                print(
-                    f"  [captions] Got {len(transcript_entries)} segments.",
-                    flush=True,
-                )
-            else:
-                print("  [captions] No captions found.", flush=True)
-
-        if not transcript_entries:
-            if allow_whisper:
-                transcript_entries = transcribe_audio(
-                    str(video_path),
-                    model_name=transcribe_model,
-                    device=transcribe_device,
-                    timeout_sec=transcribe_timeout_sec,
-                )
+        transcript_entries = load_sidecar_transcript(str(video_path))
+        if transcript_entries is not None:
+            steps.append("load_transcript")
+            print(f"  [transcript] Loaded sidecar ({len(transcript_entries)} segments).", flush=True)
+        else:
+            yt_url = source_url or (video.url if video.source == "youtube" else None)
+            if prefer_yt_captions and yt_url:
+                print("  [captions] Fetching YouTube captions...", flush=True)
+                transcript_entries = fetch_youtube_captions(yt_url, timeout_sec=caption_timeout_sec)
                 if transcript_entries:
-                    steps.append("transcribe_asr")
-            else:
-                print("  [captions] Skipping Whisper (not enabled in this mode).", flush=True)
+                    steps.append("yt_captions")
+                    print(
+                        f"  [captions] Got {len(transcript_entries)} segments.",
+                        flush=True,
+                    )
+                else:
+                    print("  [captions] No captions found.", flush=True)
+
+            if not transcript_entries:
+                if allow_whisper:
+                    cached = _load_whisper_cache(config.transcripts_dir, video_id)
+                    if cached is not None:
+                        transcript_entries = cached
+                        steps.append("whisper_cached")
+                        print(
+                            f"  [asr] Using cached Whisper transcript ({len(cached)} segments).",
+                            flush=True,
+                        )
+                    else:
+                        transcript_entries = transcribe_audio(
+                            str(video_path),
+                            model_name=transcribe_model,
+                            device=transcribe_device,
+                            timeout_sec=transcribe_timeout_sec,
+                        )
+                        if transcript_entries:
+                            _save_whisper_cache(config.transcripts_dir, video_id, transcript_entries)
+                            steps.append("transcribe_asr")
+                else:
+                    print("  [captions] Skipping Whisper (not enabled in this mode).", flush=True)
 
     if raise_on_no_transcript and not transcript_entries:
         raise NoTranscriptAvailableError("no transcript available")
@@ -460,3 +509,175 @@ def _insert_evidence_for_moment(
                 metadata={"idea_type": idea.type},
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Provider-agnostic entry point
+# ---------------------------------------------------------------------------
+
+def ingest_any_source(
+    source: str,
+    config: Config,
+    allow_whisper: bool = False,
+    provider_hint: str = "auto",
+    transcribe_model: str = "tiny",
+    transcribe_device: str = "auto",
+    transcribe_timeout_sec: Optional[float] = None,
+    caption_timeout_sec: float = 60.0,
+    download_timeout_sec: float = 600.0,
+    force: bool = False,
+    run_id: Optional[str] = None,
+) -> str:
+    """Ingest any source (URL or local file) via automatic provider detection.
+
+    Returns the video_id of the ingested video.
+    Raises NeedsTranscriptionError when captions are unavailable and
+    allow_whisper=False, so the caller can retry with allow_whisper=True.
+    Raises NoTranscriptAvailableError when no transcript is available at all.
+    """
+    from vidcrawl.db import get_video, make_video_id
+    from vidcrawl.ingest.providers.registry import get_provider
+
+    provider = get_provider(source, hint=provider_hint)
+    source = provider.normalize(source)
+    video_id = make_video_id(provider.source_type, source)
+
+    with get_db(config.db_path) as conn:
+        init_db(conn)
+        existing = get_video(conn, video_id)
+        if existing and existing.status == "ready" and not force:
+            return video_id
+
+    if provider.source_type == "local":
+        return process_local_video(
+            source, config,
+            run_id=run_id,
+            allow_whisper=allow_whisper,
+            transcribe_model=transcribe_model,
+            transcribe_device=transcribe_device,
+            transcribe_timeout_sec=transcribe_timeout_sec,
+            video_id_override=video_id,
+        )
+
+    # URL-based source: try provider captions first (fast path, no download).
+    captions: Optional[list[dict]] = provider.fetch_captions(
+        source, timeout_sec=caption_timeout_sec
+    )
+
+    if captions:
+        return _ingest_url_with_transcript(
+            source, provider, video_id, config,
+            preloaded_transcript=captions,
+            run_id=run_id,
+        )
+
+    # No captions available.
+    if not allow_whisper:
+        raise NeedsTranscriptionError(
+            f"No captions found for {source!r}. "
+            "Retry with allow_whisper=True to use Whisper ASR."
+        )
+
+    # Whisper path: check cache first, then download + transcribe.
+    cached_transcript = _load_whisper_cache(config.transcripts_dir, video_id)
+    if cached_transcript is not None:
+        return _ingest_url_with_transcript(
+            source, provider, video_id, config,
+            preloaded_transcript=cached_transcript,
+            run_id=run_id,
+        )
+
+    audio_path = provider.download_audio(
+        source,
+        str(config.videos_dir / video_id),
+        video_id,
+        timeout_sec=download_timeout_sec,
+    )
+
+    if audio_path is None:
+        raise NoTranscriptAvailableError(
+            f"Could not download audio for {source!r}."
+        )
+
+    # Run Whisper and cache result.
+    segments = transcribe_audio(
+        audio_path,
+        model_name=transcribe_model,
+        device=transcribe_device,
+        timeout_sec=transcribe_timeout_sec,
+    )
+    if segments:
+        _save_whisper_cache(config.transcripts_dir, video_id, segments)
+
+    if not segments:
+        raise NoTranscriptAvailableError(
+            f"Whisper produced no transcript for {source!r}."
+        )
+
+    return _ingest_url_with_transcript(
+        source, provider, video_id, config,
+        preloaded_transcript=segments,
+        audio_path=audio_path,
+        run_id=run_id,
+    )
+
+
+def _ingest_url_with_transcript(
+    source: str,
+    provider,
+    video_id: str,
+    config: Config,
+    preloaded_transcript: list[dict],
+    audio_path: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> str:
+    """Write metadata, create a local path, then run the pipeline."""
+    from vidcrawl.db import get_db, init_db, insert_video
+    from vidcrawl.models import Video
+
+    meta = provider.extract_metadata(source)
+
+    video_meta: dict = {}
+    if meta.description:
+        video_meta["description"] = meta.description
+    if meta.uploader:
+        video_meta["uploader"] = meta.uploader
+
+    video = Video(
+        video_id=video_id,
+        title=meta.title or "Untitled",
+        source=provider.source_type,
+        url=source,
+        duration_sec=meta.duration_sec,
+        status="pending",
+        metadata=video_meta,
+    )
+
+    with get_db(config.db_path) as conn:
+        init_db(conn)
+        existing = conn.execute(
+            "SELECT 1 FROM videos WHERE video_id = ?", (video_id,)
+        ).fetchone()
+        if existing is None:
+            insert_video(conn, video)
+
+    # Use an existing audio file if available; otherwise create a zero-byte placeholder
+    # so that process_local_video can resolve paths without needing real media.
+    if audio_path is None:
+        placeholder_dir = config.videos_dir / video_id
+        placeholder_dir.mkdir(parents=True, exist_ok=True)
+        placeholder = placeholder_dir / f"{video_id}.mp4"
+        if not placeholder.exists():
+            placeholder.write_bytes(b"")
+        local_path = str(placeholder)
+    else:
+        local_path = audio_path
+
+    return process_local_video(
+        local_path, config,
+        run_id=run_id,
+        source_url=source,
+        video_id_override=video_id,
+        preloaded_transcript=preloaded_transcript,
+        allow_whisper=False,
+    )

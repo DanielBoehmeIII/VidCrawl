@@ -505,7 +505,6 @@ def make_video_id(source: str, identifier: str) -> str:
         )
         if match:
             return match.group(1)
-        return f"yt:{identifier[:32]}"
     from vidcrawl.utils.hashing import sha256_prefix
     return sha256_prefix(identifier)
 

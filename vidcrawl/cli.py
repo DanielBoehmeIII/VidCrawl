@@ -97,7 +97,7 @@ def init(
 @app.command()
 def ingest(
     source: str = typer.Argument(
-        ..., help="YouTube URL or local file path"
+        ..., help="Video URL (YouTube/Vimeo/generic) or local file path"
     ),
     data_dir: str = typer.Option(
         "data", "--data-dir", "-d",
@@ -109,7 +109,7 @@ def ingest(
     ),
     download: bool = typer.Option(
         True, "--download/--no-download",
-        help="Download YouTube video (requires yt-dlp)",
+        help="Download video (requires yt-dlp)",
     ),
     transcribe_model: str = typer.Option(
         "tiny", "--transcribe-model",
@@ -123,27 +123,54 @@ def ingest(
         None, "--transcribe-timeout-sec",
         help="Max seconds to wait for Whisper transcription (default: no limit)",
     ),
+    caption_timeout_sec: float = typer.Option(
+        60.0, "--caption-timeout-sec",
+        help="Timeout in seconds for fetching captions",
+    ),
+    download_timeout_sec: float = typer.Option(
+        600.0, "--download-timeout-sec",
+        help="Timeout in seconds for downloading a video",
+    ),
     prefer_yt_captions: bool = typer.Option(
         False, "--prefer-yt-captions",
-        help="Use YouTube captions instead of Whisper when available",
+        help="Use provider captions instead of Whisper when available",
+    ),
+    allow_whisper: bool = typer.Option(
+        False, "--allow-whisper",
+        help="Fall back to Whisper ASR when captions are unavailable",
+    ),
+    provider: str = typer.Option(
+        "auto", "--provider",
+        help="Provider: auto, youtube, vimeo, generic, local",
     ),
 ) -> None:
     config = get_config(data_dir)
     config.ensure_dirs()
 
-    is_url = str(source).startswith(
-        ("http://", "https://", "youtube.com", "youtu.be")
-    )
+    from vidcrawl.ingest.providers.registry import get_provider as _get_provider
+    _provider = _get_provider(source, hint=provider)
+    is_url = _provider.source_type not in ("local",)
+
+    if is_url and not source.startswith(("http://", "https://")):
+        is_url = False
 
     txargs = dict(
         transcribe_model=transcribe_model,
         transcribe_device=transcribe_device,
         transcribe_timeout_sec=transcribe_timeout_sec,
         prefer_yt_captions=prefer_yt_captions,
+        allow_whisper=allow_whisper,
+        caption_timeout_sec=caption_timeout_sec,
     )
 
     if is_url:
-        _ingest_youtube(source, config, process, download, **txargs)
+        if _provider.source_type == "youtube":
+            _ingest_youtube(source, config, process, download, **txargs)
+        else:
+            _ingest_generic_url(source, config, process, download,
+                                provider_hint=provider,
+                                download_timeout_sec=download_timeout_sec,
+                                **txargs)
         return
 
     path = Path(source)
@@ -242,6 +269,50 @@ def _ingest_youtube(
             typer.echo("  Skipping download (--no-download)")
     else:
         typer.echo("  Status: pending (use --process to run pipeline)")
+
+
+def _ingest_generic_url(
+    source: str,
+    config,
+    process: bool,
+    download: bool,
+    provider_hint: str = "auto",
+    download_timeout_sec: float = 600.0,
+    **txargs,
+) -> None:
+    from vidcrawl.process.pipeline import (
+        NeedsTranscriptionError,
+        NoTranscriptAvailableError,
+        ingest_any_source,
+    )
+
+    typer.echo(f"Ingesting URL via provider '{provider_hint}': {source}")
+    if not process:
+        typer.echo("  Skipping pipeline (--no-process)")
+        return
+
+    try:
+        video_id = ingest_any_source(
+            source, config,
+            allow_whisper=txargs.get("allow_whisper", False),
+            provider_hint=provider_hint,
+            transcribe_model=txargs.get("transcribe_model", "tiny"),
+            transcribe_device=txargs.get("transcribe_device", "auto"),
+            transcribe_timeout_sec=txargs.get("transcribe_timeout_sec"),
+            caption_timeout_sec=txargs.get("caption_timeout_sec", 60.0),
+            download_timeout_sec=download_timeout_sec,
+        )
+        count = _get_moment_count(config, video_id)
+        typer.echo(f"Processed video: {video_id}")
+        typer.echo(f"Created {count} moments")
+    except NeedsTranscriptionError as e:
+        typer.echo(f"  Skipped: {e}")
+        typer.echo("  Retry with --allow-whisper to transcribe via Whisper.")
+    except NoTranscriptAvailableError as e:
+        typer.echo(f"  No transcript available: {e}", err=True)
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
 
 
 def _try_youtube_download(
@@ -1696,7 +1767,11 @@ def batch(
     ),
     download_timeout_sec: float = typer.Option(
         600.0, "--download-timeout-sec",
-        help="Timeout in seconds for downloading a YouTube video",
+        help="Timeout in seconds for downloading a video",
+    ),
+    provider: str = typer.Option(
+        "auto", "--provider",
+        help="Provider override: auto, youtube, vimeo, generic, local",
     ),
 ) -> None:
     """Batch ingest multiple videos from a URL/path list file or directory."""
@@ -1751,6 +1826,8 @@ def batch(
         "failed_sources": [],
     }
 
+    from vidcrawl.ingest.providers.registry import get_provider as _get_provider
+
     interrupted = False
     try:
         for idx, source in enumerate(sources, 1):
@@ -1758,12 +1835,13 @@ def batch(
             if not source:
                 continue
 
-            is_url = source.startswith(("http://", "https://", "youtube.com", "youtu.be"))
+            is_url = source.startswith(("http://", "https://"))
 
             if is_url:
-                typer.echo(f"[{idx}/{total}] Normalizing URL...")
-                source = normalize_youtube_url(source)
-                video_id = make_video_id("youtube", source)
+                typer.echo(f"[{idx}/{total}] Detecting provider...")
+                _prov = _get_provider(source, hint=provider)
+                source = _prov.normalize(source)
+                video_id = make_video_id(_prov.source_type, source)
                 label = source[:70]
             else:
                 path = Path(source)
@@ -1801,13 +1879,21 @@ def batch(
 
             try:
                 if is_url:
-                    _batch_ingest_youtube(
-                        source, video_id, config, process, effective_download,
-                        max_duration_sec=max_duration_sec,
-                        meta_timeout_sec=meta_timeout_sec,
-                        download_timeout_sec=download_timeout_sec,
-                        **txargs,
-                    )
+                    if _prov.source_type == "youtube":
+                        _batch_ingest_youtube(
+                            source, video_id, config, process, effective_download,
+                            max_duration_sec=max_duration_sec,
+                            meta_timeout_sec=meta_timeout_sec,
+                            download_timeout_sec=download_timeout_sec,
+                            **txargs,
+                        )
+                    else:
+                        _batch_ingest_generic_url(
+                            source, video_id, config, process,
+                            provider_hint=provider,
+                            download_timeout_sec=download_timeout_sec,
+                            **txargs,
+                        )
                     if rate_limit_sec > 0 and idx < total:
                         time.sleep(rate_limit_sec)
                 else:
@@ -1842,8 +1928,14 @@ def batch(
                 run_stats["skipped_duration"] += 1
 
             except Exception as exc:
-                from vidcrawl.process.pipeline import NoTranscriptAvailableError
-                if isinstance(exc, NoTranscriptAvailableError):
+                from vidcrawl.process.pipeline import (
+                    NeedsTranscriptionError,
+                    NoTranscriptAvailableError,
+                )
+                if isinstance(exc, NeedsTranscriptionError):
+                    typer.echo("  Skipped: needs transcription (retry with --allow-whisper)")
+                    run_stats["skipped_no_transcript"] += 1
+                elif isinstance(exc, NoTranscriptAvailableError):
                     typer.echo("  Skipped: no transcript available")
                     run_stats["skipped_no_transcript"] += 1
                 else:
@@ -2023,6 +2115,36 @@ def _batch_ingest_youtube(
             raise_on_no_transcript=_pref_captions and _whisper_off,
             **txargs
         )
+
+
+def _batch_ingest_generic_url(
+    url: str,
+    video_id: str,
+    config,
+    process: bool,
+    provider_hint: str = "auto",
+    download_timeout_sec: float = 600.0,
+    **txargs,
+) -> None:
+    from vidcrawl.process.pipeline import (
+        NeedsTranscriptionError,
+        NoTranscriptAvailableError,
+        ingest_any_source,
+    )
+
+    if not process:
+        return
+
+    ingest_any_source(
+        url, config,
+        allow_whisper=txargs.get("allow_whisper", False),
+        provider_hint=provider_hint,
+        transcribe_model=txargs.get("transcribe_model", "tiny"),
+        transcribe_device=txargs.get("transcribe_device", "auto"),
+        transcribe_timeout_sec=txargs.get("transcribe_timeout_sec"),
+        caption_timeout_sec=txargs.get("caption_timeout_sec", 60.0),
+        download_timeout_sec=download_timeout_sec,
+    )
 
 
 def _batch_ingest_local(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -69,6 +70,7 @@ class CaptureRequest(BaseModel):
     selected_text: Optional[str] = None
     page_text: Optional[str] = None
     page_html: Optional[str] = None
+    allow_whisper: bool = False
     # Batch form: {"sources": [...], "mode": "captions_first"}
     sources: Optional[list[ClipBounceSource]] = None
     mode: str = "default"
@@ -94,6 +96,12 @@ class JobResponse(BaseModel):
 # Background worker
 # ---------------------------------------------------------------------------
 
+_VIDEO_HOSTS: frozenset[str] = frozenset({
+    "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be",
+    "vimeo.com", "www.vimeo.com", "player.vimeo.com",
+})
+
+
 def _is_youtube_url(url: str) -> bool:
     return any(
         url.startswith(prefix)
@@ -101,6 +109,14 @@ def _is_youtube_url(url: str) -> bool:
                        "http://www.youtube.com", "http://youtu.be",
                        "youtube.com", "youtu.be")
     )
+
+
+def _is_known_video_url(url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return host in _VIDEO_HOSTS
 
 
 def _ingest_worker(
@@ -114,94 +130,31 @@ def _ingest_worker(
     transcribe_model: str,
 ) -> None:
     """Runs in a thread — ingests one source and updates the job record."""
-    from vidcrawl.db import (
-        generate_run_id,
-        insert_ingestion_run,
-        insert_video,
+    from vidcrawl.ingest.providers.registry import get_provider
+    from vidcrawl.process.pipeline import (
+        NeedsTranscriptionError,
+        NoTranscriptAvailableError,
+        ingest_any_source,
+        process_local_video,
     )
-    from vidcrawl.ingest.downloader import (
-        extract_youtube_metadata,
-        is_yt_dlp_available,
-        normalize_youtube_url,
-    )
-    from vidcrawl.models import IngestionRun, Video
 
     db_path = config.db_path
 
     try:
-        is_url = _is_youtube_url(source) or source.startswith(("http://", "https://"))
-
-        if is_url:
-            url = normalize_youtube_url(source)
-            video_id = make_video_id("youtube", url)
+        if source.startswith(("http://", "https://")):
+            provider = get_provider(source)
+            url = provider.normalize(source)
+            video_id = make_video_id(provider.source_type, url)
 
             with get_db(db_path) as conn:
                 update_job(conn, job_id, "running", video_id=video_id)
 
-            meta: dict = {}
-            if is_yt_dlp_available():
-                meta = extract_youtube_metadata(url)
-
-            title = meta.get("title", f"YouTube video {video_id}")
-            duration = float(meta.get("duration", 0))
-            video_meta: dict = {}
-            if meta.get("description"):
-                video_meta["description"] = meta["description"]
-            if meta.get("uploader"):
-                video_meta["uploader"] = meta["uploader"]
-
-            video = Video(
-                video_id=video_id,
-                title=title,
-                source="youtube",
-                url=url,
-                duration_sec=duration,
-                status="pending",
-                metadata=video_meta,
-            )
-            run = IngestionRun(
-                run_id=generate_run_id(),
-                video_id=video_id,
-                status="running",
-                pipeline_steps=["register_metadata"],
-            )
-
-            with get_db(db_path) as conn:
-                existing = get_video(conn, video_id)
-                if existing is None:
-                    insert_video(conn, video)
-                insert_ingestion_run(conn, run)
-
             if process:
-                from vidcrawl.process.pipeline import process_local_video
-                from vidcrawl.ingest.downloader import download_youtube
-
-                if download and is_yt_dlp_available():
-                    dl_dir = config.videos_dir / video_id
-                    downloaded = download_youtube(url, str(dl_dir), video_id)
-                    if downloaded:
-                        process_local_video(
-                            downloaded, config, source_url=url,
-                            video_id_override=video_id,
-                            prefer_yt_captions=prefer_yt_captions,
-                            allow_whisper=allow_whisper,
-                            transcribe_model=transcribe_model,
-                        )
-                else:
-                    # Caption-only: zero-byte placeholder
-                    ph_dir = config.videos_dir / video_id
-                    ph_dir.mkdir(parents=True, exist_ok=True)
-                    ph = ph_dir / f"{video_id}.mp4"
-                    if not ph.exists():
-                        ph.write_bytes(b"")
-                    process_local_video(
-                        str(ph), config, source_url=url,
-                        video_id_override=video_id,
-                        prefer_yt_captions=prefer_yt_captions,
-                        allow_whisper=allow_whisper,
-                        transcribe_model=transcribe_model,
-                        raise_on_no_transcript=prefer_yt_captions and not allow_whisper,
-                    )
+                ingest_any_source(
+                    url, config,
+                    allow_whisper=allow_whisper,
+                    transcribe_model=transcribe_model,
+                )
 
         else:
             # Local file
@@ -212,35 +165,23 @@ def _ingest_worker(
                 update_job(conn, job_id, "running", video_id=video_id)
 
             if process:
-                from vidcrawl.process.pipeline import process_local_video
                 process_local_video(
                     str(path), config,
                     transcribe_model=transcribe_model,
+                    allow_whisper=allow_whisper,
                 )
-            else:
-                video = Video(
-                    video_id=video_id,
-                    title=path.stem,
-                    source="local",
-                    url=None,
-                    duration_sec=0.0,
-                    status="pending",
-                )
-                run = IngestionRun(
-                    run_id=generate_run_id(),
-                    video_id=video_id,
-                    status="running",
-                    pipeline_steps=["register_metadata"],
-                )
-                with get_db(db_path) as conn:
-                    existing = get_video(conn, video_id)
-                    if existing is None:
-                        insert_video(conn, video)
-                    insert_ingestion_run(conn, run)
 
         with get_db(db_path) as conn:
             update_job(conn, job_id, "ready", video_id=video_id)
 
+    except NeedsTranscriptionError as exc:
+        with get_db(db_path) as conn:
+            update_job(conn, job_id, "needs_transcription",
+                       error_message=str(exc))
+    except NoTranscriptAvailableError as exc:
+        with get_db(db_path) as conn:
+            update_job(conn, job_id, "skipped_no_transcript",
+                       error_message=str(exc))
     except Exception as exc:
         with get_db(db_path) as conn:
             update_job(conn, job_id, "error", error_message=str(exc))
@@ -446,63 +387,68 @@ def create_app(config: Config) -> FastAPI:
     # POST /clipbounce/capture
     # ----------------------------------------------------------------
 
-    def _capture_one(url_raw: str) -> JobResponse:
+    def _capture_one(url_raw: str, allow_whisper: bool = False) -> JobResponse:
         """Ingest a single URL and return a JobResponse (deduped)."""
-        from vidcrawl.ingest.downloader import normalize_youtube_url
+        from vidcrawl.ingest.providers.registry import get_provider
 
         url = url_raw.strip()
-        is_yt = _is_youtube_url(url)
 
-        if is_yt:
-            url = normalize_youtube_url(url)
-            video_id = make_video_id("youtube", url)
-
-            with get_db(config.db_path) as conn:
-                existing_video = get_video(conn, video_id)
-                existing_job = find_job_by_url(conn, url)
-
-            if existing_video and existing_video.status == "ready":
-                if existing_job:
-                    return JobResponse(**existing_job)
-                with get_db(config.db_path) as conn:
-                    job_id = create_job(conn, url, video_id=video_id)
-                    update_job(conn, job_id, "skipped", video_id=video_id)
-                    job = get_job(conn, job_id)
-                return JobResponse(**job)
-
-            if existing_job and existing_job["status"] in ("queued", "running", "ready"):
-                return JobResponse(**existing_job)
-
-            with get_db(config.db_path) as conn:
-                job_id = create_job(conn, url, video_id=video_id)
-
-            _submit(job_id, url, True, False, True, False, "tiny")
-
-            with get_db(config.db_path) as conn:
-                job = get_job(conn, job_id)
-            return JobResponse(**job)
-
-        else:
+        if not _is_known_video_url(url):
             with get_db(config.db_path) as conn:
                 existing_job = find_job_by_url(conn, url)
-                if existing_job and existing_job["status"] in ("queued", "running", "ready", "skipped"):
+                if existing_job and existing_job["status"] in (
+                    "queued", "running", "ready", "skipped"
+                ):
                     return JobResponse(**existing_job)
                 job_id = create_job(conn, url)
                 update_job(conn, job_id, "skipped",
-                           result={"reason": "non-youtube URL not processed"})
+                           result={"reason": "non-video URL not processed"})
                 job = get_job(conn, job_id)
             return JobResponse(**job)
+
+        provider = get_provider(url)
+        url = provider.normalize(url)
+        video_id = make_video_id(provider.source_type, url)
+
+        with get_db(config.db_path) as conn:
+            existing_video = get_video(conn, video_id)
+            existing_job = find_job_by_url(conn, url)
+
+        if existing_video and existing_video.status == "ready":
+            if existing_job:
+                return JobResponse(**existing_job)
+            with get_db(config.db_path) as conn:
+                job_id = create_job(conn, url, video_id=video_id)
+                update_job(conn, job_id, "skipped", video_id=video_id)
+                job = get_job(conn, job_id)
+            return JobResponse(**job)
+
+        if existing_job and existing_job["status"] in ("queued", "running", "ready"):
+            return JobResponse(**existing_job)
+
+        with get_db(config.db_path) as conn:
+            job_id = create_job(conn, url, video_id=video_id)
+
+        _submit(job_id, url, True, False, True, allow_whisper, "tiny")
+
+        with get_db(config.db_path) as conn:
+            job = get_job(conn, job_id)
+        return JobResponse(**job)
 
     @app.post("/clipbounce/capture")
     def clipbounce_capture(req: CaptureRequest) -> Union[JobResponse, BatchCaptureResponse]:
         if req.sources is not None:
             # Batch form: {"sources": [...], "mode": "captions_first"}
-            jobs = [_capture_one(src.url) for src in req.sources if src.url.strip()]
+            jobs = [
+                _capture_one(src.url, allow_whisper=req.allow_whisper)
+                for src in req.sources
+                if src.url.strip()
+            ]
             return BatchCaptureResponse(mode=req.mode, jobs=jobs)
 
         # Single-URL form
         if not req.url:
             raise HTTPException(status_code=422, detail="Either 'url' or 'sources' must be provided")
-        return _capture_one(req.url)
+        return _capture_one(req.url, allow_whisper=req.allow_whisper)
 
     return app

@@ -9,7 +9,10 @@ JOBS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS api_jobs (
     job_id        TEXT PRIMARY KEY,
     status        TEXT NOT NULL DEFAULT 'queued'
-                  CHECK(status IN ('queued','running','ready','error','skipped')),
+                  CHECK(status IN (
+                      'queued','running','ready','error','skipped',
+                      'needs_transcription','skipped_no_transcript'
+                  )),
     source_url    TEXT NOT NULL,
     video_id      TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),

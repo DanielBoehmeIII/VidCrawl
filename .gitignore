@@ -10,3 +10,5 @@ vidcrawl.db
 .DS_Store
 .env
 .venv/
+sources.txt
+big_sources.txt
