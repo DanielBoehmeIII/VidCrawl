@@ -3,6 +3,10 @@ from pathlib import Path
 from typing import Optional
 
 from vidcrawl.config import Config
+
+
+class NoTranscriptAvailableError(Exception):
+    """Raised in caption-only mode when no transcript source is available."""
 from vidcrawl.db import (
     complete_ingestion_run,
     generate_evidence_id,
@@ -27,7 +31,11 @@ from vidcrawl.db import (
 )
 from vidcrawl.ingest.downloader import accept_local
 from vidcrawl.ingest.metadata import extract_duration, extract_file_metadata
-from vidcrawl.ingest.transcript import load_sidecar_transcript, transcribe_audio
+from vidcrawl.ingest.transcript import (
+    fetch_youtube_captions,
+    load_sidecar_transcript,
+    transcribe_audio,
+)
 from vidcrawl.models import Evidence, Idea, IngestionRun, Keyframe, Moment, Video
 from vidcrawl.process.chunking import chunk_transcript
 from vidcrawl.process.ideas import extract_ideas
@@ -39,9 +47,18 @@ def process_local_video(
     video_path: str,
     config: Config,
     run_id: Optional[str] = None,
+    transcribe_model: str = "tiny",
+    transcribe_device: str = "auto",
+    transcribe_timeout_sec: Optional[float] = None,
+    prefer_yt_captions: bool = False,
+    allow_whisper: bool = True,
+    caption_timeout_sec: float = 60.0,
+    source_url: Optional[str] = None,
+    video_id_override: Optional[str] = None,
+    raise_on_no_transcript: bool = False,
 ) -> str:
     path = Path(video_path).resolve()
-    video_id = make_video_id("local", str(path))
+    video_id = video_id_override or make_video_id("local", str(path))
     title = path.stem
 
     with get_db(config.db_path) as conn:
@@ -78,6 +95,7 @@ def process_local_video(
             update_video_status(conn, video_id, "ingesting")
             md = extract_file_metadata(str(path))
             video.metadata = md
+            _clear_video_pipeline_data(conn, video_id)
 
             if run_id is None:
                 run_id = generate_run_id()
@@ -94,7 +112,22 @@ def process_local_video(
         steps = ["register_metadata"]
 
         try:
-            _run_pipeline(conn, config, video, path, run_id, steps)
+            _run_pipeline(
+                conn, config, video, path, run_id, steps,
+                transcribe_model=transcribe_model,
+                transcribe_device=transcribe_device,
+                transcribe_timeout_sec=transcribe_timeout_sec,
+                prefer_yt_captions=prefer_yt_captions,
+                allow_whisper=allow_whisper,
+                caption_timeout_sec=caption_timeout_sec,
+                source_url=source_url,
+                raise_on_no_transcript=raise_on_no_transcript,
+            )
+        except NoTranscriptAvailableError:
+            update_video_status(conn, video_id, "pending")
+            complete_ingestion_run(conn, run_id, "failed", "no transcript available")
+            conn.commit()
+            raise
         except Exception as exc:
             update_video_status(conn, video_id, "error", str(exc))
             complete_ingestion_run(conn, run_id, "failed", str(exc))
@@ -111,22 +144,74 @@ def _run_pipeline(
     video_path: Path,
     run_id: str,
     steps: list[str],
+    transcribe_model: str = "tiny",
+    transcribe_device: str = "auto",
+    transcribe_timeout_sec: Optional[float] = None,
+    prefer_yt_captions: bool = False,
+    allow_whisper: bool = True,
+    caption_timeout_sec: float = 60.0,
+    source_url: Optional[str] = None,
+    raise_on_no_transcript: bool = False,
 ) -> None:
     video_id = video.video_id
 
     transcript_entries = load_sidecar_transcript(str(video_path))
     if transcript_entries is not None:
         steps.append("load_transcript")
+        print(f"  [transcript] Loaded sidecar ({len(transcript_entries)} segments).", flush=True)
     else:
-        transcript_entries = transcribe_audio(str(video_path))
-        if transcript_entries:
-            steps.append("transcribe_asr")
+        yt_url = source_url or (video.url if video.source == "youtube" else None)
+        if prefer_yt_captions and yt_url:
+            print("  [captions] Fetching YouTube captions...", flush=True)
+            transcript_entries = fetch_youtube_captions(yt_url, timeout_sec=caption_timeout_sec)
+            if transcript_entries:
+                steps.append("yt_captions")
+                print(
+                    f"  [captions] Got {len(transcript_entries)} segments.",
+                    flush=True,
+                )
+            else:
+                print("  [captions] No captions found.", flush=True)
 
+        if not transcript_entries:
+            if allow_whisper:
+                transcript_entries = transcribe_audio(
+                    str(video_path),
+                    model_name=transcribe_model,
+                    device=transcribe_device,
+                    timeout_sec=transcribe_timeout_sec,
+                )
+                if transcript_entries:
+                    steps.append("transcribe_asr")
+            else:
+                print("  [captions] Skipping Whisper (not enabled in this mode).", flush=True)
+
+    if raise_on_no_transcript and not transcript_entries:
+        raise NoTranscriptAvailableError("no transcript available")
+
+    print("  [chunking] Chunking transcript...", flush=True)
     chunks = chunk_transcript(transcript_entries) if transcript_entries else []
     if chunks:
         steps.append("chunk_transcript")
+        print(f"  [chunking] {len(chunks)} chunk(s).", flush=True)
     else:
         chunks = _create_fallback_chunks(video.duration_sec, video_id)
+        print(f"  [chunking] Using {len(chunks)} fallback chunk(s).", flush=True)
+
+    if video.duration_sec <= 0:
+        inferred = 0.0
+        if transcript_entries:
+            inferred = max(
+                (e.get("end_sec", 0.0) for e in transcript_entries), default=0.0
+            )
+        if inferred <= 0 and chunks:
+            inferred = max((c["end_sec"] for c in chunks), default=0.0)
+        if inferred > 0:
+            video.duration_sec = inferred
+            conn.execute(
+                "UPDATE videos SET duration_sec = ? WHERE video_id = ?",
+                (inferred, video_id),
+            )
 
     kf_dir = config.frames_dir / video_id
     kf_dir.mkdir(parents=True, exist_ok=True)
@@ -152,6 +237,7 @@ def _run_pipeline(
     if ocr_results:
         steps.append("ocr_frames")
 
+    print(f"  [db] Writing {len(chunks)} moment(s)...", flush=True)
     moments = []
     for chunk in chunks:
         moment_id = make_moment_id(video_id, chunk["start_sec"], chunk["end_sec"])
@@ -216,19 +302,51 @@ def _run_pipeline(
         )
 
 
+def _clear_video_pipeline_data(conn, video_id: str) -> None:
+    """Delete all pipeline outputs for a video so it can be cleanly re-processed."""
+    conn.execute(
+        "DELETE FROM duplicates WHERE moment_id IN "
+        "(SELECT moment_id FROM moments WHERE video_id = ?)",
+        (video_id,),
+    )
+    conn.execute(
+        "DELETE FROM duplicates WHERE canonical_moment_id IN "
+        "(SELECT moment_id FROM moments WHERE video_id = ?)",
+        (video_id,),
+    )
+    conn.execute(
+        "DELETE FROM ideas WHERE moment_id IN "
+        "(SELECT moment_id FROM moments WHERE video_id = ?)",
+        (video_id,),
+    )
+    conn.execute(
+        "DELETE FROM modal_evidence WHERE moment_id IN "
+        "(SELECT moment_id FROM moments WHERE video_id = ?)",
+        (video_id,),
+    )
+    conn.execute(
+        "DELETE FROM keyframes WHERE video_id = ?",
+        (video_id,),
+    )
+    conn.execute(
+        "DELETE FROM moments WHERE video_id = ?",
+        (video_id,),
+    )
+
+
 def _create_fallback_chunks(
     duration_sec: float, video_id: str
 ) -> list[dict]:
     if duration_sec <= 0:
         duration_sec = 60.0
-    chunk_duration = min(60.0, duration_sec)
-    return [
-        {
-            "start_sec": 0.0,
-            "end_sec": min(chunk_duration, duration_sec),
-            "transcript_text": "",
-        }
-    ]
+    chunk_size = 60.0
+    chunks = []
+    start = 0.0
+    while start < duration_sec:
+        end = min(start + chunk_size, duration_sec)
+        chunks.append({"start_sec": start, "end_sec": end, "transcript_text": ""})
+        start = end
+    return chunks
 
 
 def _get_ocr_for_moment(
@@ -297,6 +415,7 @@ def _insert_evidence_for_moment(
         if moment.start_sec <= o.get("timestamp_sec", 0) <= moment.end_sec
     ]
     for ocr in ocr_for_moment:
+        _conf = ocr.get("confidence")
         insert_evidence(
             conn,
             Evidence(
@@ -304,7 +423,7 @@ def _insert_evidence_for_moment(
                 moment_id=moment.moment_id,
                 modality="ocr",
                 content=ocr.get("text", ""),
-                confidence=ocr.get("confidence", 1.0),
+                confidence=_conf if _conf is not None else 1.0,
                 source="tesseract",
                 metadata={"timestamp_sec": ocr.get("timestamp_sec", 0)},
             ),

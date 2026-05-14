@@ -177,6 +177,12 @@ Test"""
             assert entries is None
 
     def test_transcribe_audio_whisper_not_installed(self):
+        try:
+            import whisper  # noqa: F401
+            import pytest
+            pytest.skip("openai-whisper is installed; test only applies when it is absent")
+        except ImportError:
+            pass
         import warnings
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
@@ -222,7 +228,7 @@ class TestChunking:
         chunks = chunk_transcript(entries, max_duration=45.0)
         assert len(chunks) >= 2
 
-    def test_overlap_creates_multiple_chunks_with_overlap(self):
+    def test_long_entries_split_into_multiple_chunks(self):
         entries = [
             {"start_sec": 0.0, "end_sec": 10.0, "text": "Segment A"},
             {"start_sec": 10.0, "end_sec": 20.0, "text": "Segment B"},
@@ -232,7 +238,7 @@ class TestChunking:
             {"start_sec": 50.0, "end_sec": 60.0, "text": "Segment F"},
             {"start_sec": 60.0, "end_sec": 70.0, "text": "Segment G"},
         ]
-        chunks = chunk_transcript(entries, max_duration=25.0, overlap_sec=5.0)
+        chunks = chunk_transcript(entries, max_duration=25.0)
         assert len(chunks) >= 3
         assert chunks[0]["start_sec"] <= chunks[1]["start_sec"]
 
@@ -373,10 +379,13 @@ class TestIdeas:
 class TestPipelineHelpers:
     def test_fallback_chunks_positive_duration(self):
         chunks = _create_fallback_chunks(120.0, "test_vid")
-        assert len(chunks) == 1
+        # 120s / 60s chunk = 2 chunks
+        assert len(chunks) == 2
         assert chunks[0]["start_sec"] == 0.0
         assert chunks[0]["end_sec"] == 60.0
         assert chunks[0]["transcript_text"] == ""
+        assert chunks[1]["start_sec"] == 60.0
+        assert chunks[1]["end_sec"] == 120.0
 
     def test_fallback_chunks_zero_duration(self):
         chunks = _create_fallback_chunks(0.0, "test_vid")

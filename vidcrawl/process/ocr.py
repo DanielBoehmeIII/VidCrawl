@@ -51,7 +51,7 @@ def ocr_frames(frame_paths: list[dict]) -> list[dict]:
                         conf_count += 1
 
             text = " ".join(text_parts)
-            confidence = round(total_conf / conf_count, 2) if conf_count > 0 else None
+            confidence = round(total_conf / conf_count, 2) if conf_count > 0 else 1.0
 
             if text:
                 results.append({

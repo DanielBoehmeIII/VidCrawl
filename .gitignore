@@ -9,3 +9,4 @@ data/
 vidcrawl.db
 .DS_Store
 .env
+.venv/

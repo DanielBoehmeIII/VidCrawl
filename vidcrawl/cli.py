@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -110,6 +111,22 @@ def ingest(
         True, "--download/--no-download",
         help="Download YouTube video (requires yt-dlp)",
     ),
+    transcribe_model: str = typer.Option(
+        "tiny", "--transcribe-model",
+        help="Whisper model: tiny, base, small, medium, large",
+    ),
+    transcribe_device: str = typer.Option(
+        "auto", "--transcribe-device",
+        help="Transcription device: cpu, cuda, auto",
+    ),
+    transcribe_timeout_sec: Optional[float] = typer.Option(
+        None, "--transcribe-timeout-sec",
+        help="Max seconds to wait for Whisper transcription (default: no limit)",
+    ),
+    prefer_yt_captions: bool = typer.Option(
+        False, "--prefer-yt-captions",
+        help="Use YouTube captions instead of Whisper when available",
+    ),
 ) -> None:
     config = get_config(data_dir)
     config.ensure_dirs()
@@ -118,8 +135,15 @@ def ingest(
         ("http://", "https://", "youtube.com", "youtu.be")
     )
 
+    txargs = dict(
+        transcribe_model=transcribe_model,
+        transcribe_device=transcribe_device,
+        transcribe_timeout_sec=transcribe_timeout_sec,
+        prefer_yt_captions=prefer_yt_captions,
+    )
+
     if is_url:
-        _ingest_youtube(source, config, process, download)
+        _ingest_youtube(source, config, process, download, **txargs)
         return
 
     path = Path(source)
@@ -136,7 +160,7 @@ def ingest(
         typer.echo(f"Processing local video: {path.resolve()}")
         try:
             from vidcrawl.process.pipeline import process_local_video
-            video_id = process_local_video(str(path), config)
+            video_id = process_local_video(str(path), config, **txargs)
             typer.echo(f"Processed video: {video_id}")
             count = _get_moment_count(config, video_id)
             typer.echo(f"Created {count} moments")
@@ -148,22 +172,24 @@ def ingest(
 
 
 def _ingest_youtube(
-    source: str, config, process: bool, download: bool
+    source: str, config, process: bool, download: bool, **txargs
 ) -> None:
     from vidcrawl.ingest.downloader import (
         download_youtube,
         extract_youtube_metadata,
         is_yt_dlp_available,
+        normalize_youtube_url,
         yt_dlp_install_help,
     )
 
+    source = normalize_youtube_url(source)
     video_id = make_video_id("youtube", source)
 
     existing = _get_video_by_id(config, video_id)
     if existing:
         typer.echo(f"Video '{video_id}' already exists. Skipping registration.")
         if process and download:
-            _try_youtube_download(source, video_id, config, existing)
+            _try_youtube_download(source, video_id, config, existing, **txargs)
         return
 
     meta = {}
@@ -211,7 +237,7 @@ def _ingest_youtube(
 
     if process:
         if download:
-            _try_youtube_download(source, video_id, config, video)
+            _try_youtube_download(source, video_id, config, video, **txargs)
         else:
             typer.echo("  Skipping download (--no-download)")
     else:
@@ -219,7 +245,7 @@ def _ingest_youtube(
 
 
 def _try_youtube_download(
-    url: str, video_id: str, config, video,
+    url: str, video_id: str, config, video, **txargs
 ) -> None:
     from vidcrawl.ingest.downloader import (
         download_youtube,
@@ -246,7 +272,10 @@ def _try_youtube_download(
 
     from vidcrawl.process.pipeline import process_local_video
     try:
-        new_id = process_local_video(downloaded, config)
+        new_id = process_local_video(
+            downloaded, config, source_url=url,
+            video_id_override=video_id, **txargs
+        )
         count = _get_moment_count(config, new_id)
         typer.echo(f"Processed video: {new_id}")
         typer.echo(f"Created {count} moments")
@@ -432,12 +461,8 @@ def reindex(
     config = get_config(data_dir)
     _ensure_db(config)
 
-    conn = get_db(config.db_path)
-    try:
-        init_db(conn)
+    with get_db(config.db_path) as conn:
         rebuild_fts(conn)
-    finally:
-        conn.close()
 
     typer.echo("FTS index rebuilt.")
 
@@ -1595,6 +1620,266 @@ def embed(
 
 
 # ----------------------------------------------------------------
+# batch
+# ----------------------------------------------------------------
+
+
+class _SkipDuration(Exception):
+    """Raised internally when a video exceeds --max-duration-sec."""
+
+
+@app.command()
+def batch(
+    source_list: str = typer.Argument(
+        ...,
+        help="Text file (one URL/path per line) or directory of video files",
+    ),
+    data_dir: str = typer.Option(
+        "data", "--data-dir", "-d",
+        help="Data directory path",
+    ),
+    limit: int = typer.Option(
+        10, "--limit", "-l",
+        help="Max videos to process (default: 10)",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Preview which videos would be processed without writing to DB",
+    ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Re-process videos that are already in the DB",
+    ),
+    process: bool = typer.Option(
+        True, "--process/--no-process",
+        help="Run full processing pipeline",
+    ),
+    download: bool = typer.Option(
+        True, "--download/--no-download",
+        help="Download YouTube videos (requires yt-dlp); auto-disabled when --prefer-yt-captions is set",
+    ),
+    rate_limit_sec: float = typer.Option(
+        1.0, "--rate-limit-sec",
+        help="Seconds to pause between external API calls (YouTube)",
+    ),
+    transcribe_model: str = typer.Option(
+        "tiny", "--transcribe-model",
+        help="Whisper model: tiny, base, small, medium, large",
+    ),
+    transcribe_device: str = typer.Option(
+        "auto", "--transcribe-device",
+        help="Transcription device: cpu, cuda, auto",
+    ),
+    transcribe_timeout_sec: Optional[float] = typer.Option(
+        None, "--transcribe-timeout-sec",
+        help="Max seconds to wait for Whisper transcription per video (default: no limit)",
+    ),
+    prefer_yt_captions: bool = typer.Option(
+        False, "--prefer-yt-captions",
+        help="Use YouTube captions instead of Whisper when available; also disables download by default",
+    ),
+    allow_whisper: bool = typer.Option(
+        False, "--allow-whisper",
+        help="Fall back to Whisper ASR when captions are unavailable (default: off in batch mode)",
+    ),
+    max_duration_sec: Optional[float] = typer.Option(
+        None, "--max-duration-sec",
+        help="Skip videos longer than this many seconds",
+    ),
+    meta_timeout_sec: float = typer.Option(
+        30.0, "--meta-timeout-sec",
+        help="Timeout in seconds for fetching YouTube metadata per video",
+    ),
+    caption_timeout_sec: float = typer.Option(
+        60.0, "--caption-timeout-sec",
+        help="Timeout in seconds for fetching YouTube captions per video",
+    ),
+    download_timeout_sec: float = typer.Option(
+        600.0, "--download-timeout-sec",
+        help="Timeout in seconds for downloading a YouTube video",
+    ),
+) -> None:
+    """Batch ingest multiple videos from a URL/path list file or directory."""
+    from vidcrawl.ingest.downloader import normalize_youtube_url
+
+    config = get_config(data_dir)
+    _ensure_db(config)
+
+    try:
+        sources = _collect_batch_sources(source_list)
+    except FileNotFoundError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+
+    if not sources:
+        typer.echo("No sources found in the provided list/directory.")
+        raise typer.Exit(0)
+
+    sources = sources[:limit]
+    total = len(sources)
+
+    # When --prefer-yt-captions is active, skip full download by default.
+    effective_download = download and not prefer_yt_captions
+
+    typer.echo(f"Batch: {total} source(s) to process (limit={limit})")
+    if prefer_yt_captions:
+        typer.echo("  Mode: YouTube captions (download disabled, Whisper disabled unless --allow-whisper)")
+    if max_duration_sec is not None:
+        typer.echo(f"  Max duration: {max_duration_sec:.0f}s")
+    if dry_run:
+        typer.echo("Dry run mode — no changes will be written.")
+
+    txargs = dict(
+        transcribe_model=transcribe_model,
+        transcribe_device=transcribe_device,
+        transcribe_timeout_sec=transcribe_timeout_sec,
+        prefer_yt_captions=prefer_yt_captions,
+        allow_whisper=allow_whisper,
+        caption_timeout_sec=caption_timeout_sec,
+    )
+
+    run_stats = {
+        "attempted": 0,
+        "inserted": 0,
+        "skipped_existing": 0,
+        "skipped_duration": 0,
+        "skipped_no_transcript": 0,
+        "failed": 0,
+        "new_moments": 0,
+        "new_evidence": 0,
+        "new_ideas": 0,
+        "failed_sources": [],
+    }
+
+    interrupted = False
+    try:
+        for idx, source in enumerate(sources, 1):
+            source = source.strip()
+            if not source:
+                continue
+
+            is_url = source.startswith(("http://", "https://", "youtube.com", "youtu.be"))
+
+            if is_url:
+                typer.echo(f"[{idx}/{total}] Normalizing URL...")
+                source = normalize_youtube_url(source)
+                video_id = make_video_id("youtube", source)
+                label = source[:70]
+            else:
+                path = Path(source)
+                if not path.exists():
+                    typer.echo(
+                        f"[{idx}/{total}] FAILED (not found): {source}", err=True
+                    )
+                    run_stats["attempted"] += 1
+                    run_stats["failed"] += 1
+                    run_stats["failed_sources"].append(source)
+                    continue
+                video_id = make_video_id("local", str(path.resolve()))
+                label = path.name
+
+            typer.echo(f"[{idx}/{total}] {label}")
+            run_stats["attempted"] += 1
+
+            typer.echo(f"  Checking existing video ({video_id})...")
+            existing = _get_video_by_id(config, video_id)
+            if existing and existing.status == "ready" and not force:
+                typer.echo(f"  Skipping: already processed ({video_id})")
+                run_stats["skipped_existing"] += 1
+                continue
+
+            # Track whether we're rebuilding an existing video so the summary
+            # can report absolute rebuilt counts instead of a misleading delta.
+            was_force_reprocess = existing is not None and force
+
+            if dry_run:
+                action = "re-process" if existing else "ingest"
+                typer.echo(f"  Would {action}: {video_id}")
+                continue
+
+            m_before, ev_before, id_before = _count_batch_rows(config.db_path, video_id)
+
+            try:
+                if is_url:
+                    _batch_ingest_youtube(
+                        source, video_id, config, process, effective_download,
+                        max_duration_sec=max_duration_sec,
+                        meta_timeout_sec=meta_timeout_sec,
+                        download_timeout_sec=download_timeout_sec,
+                        **txargs,
+                    )
+                    if rate_limit_sec > 0 and idx < total:
+                        time.sleep(rate_limit_sec)
+                else:
+                    _batch_ingest_local(
+                        str(path.resolve()), video_id, config, process, **txargs
+                    )
+
+                m_after, ev_after, id_after = _count_batch_rows(config.db_path, video_id)
+
+                # When the pipeline replaces existing moments (force-rebuild OR any
+                # reprocess where prior moments existed), the delta m_after-m_before
+                # can be 0 even though N moments were actually written. Report
+                # absolute post-run totals in that case so the count is accurate.
+                is_rebuild = was_force_reprocess or m_before > 0
+                if is_rebuild:
+                    dm, dev, did = m_after, ev_after, id_after
+                    summary_verb = "rebuilt"
+                else:
+                    dm = m_after - m_before
+                    dev = ev_after - ev_before
+                    did = id_after - id_before
+                    summary_verb = "new"
+
+                run_stats["inserted"] += 1
+                run_stats["new_moments"] += dm
+                run_stats["new_evidence"] += dev
+                run_stats["new_ideas"] += did
+                typer.echo(f"  OK: {dm} moments {summary_verb}, {dev} evidence, {did} ideas")
+
+            except _SkipDuration as exc:
+                typer.echo(f"  Skipped (duration): {exc}")
+                run_stats["skipped_duration"] += 1
+
+            except Exception as exc:
+                from vidcrawl.process.pipeline import NoTranscriptAvailableError
+                if isinstance(exc, NoTranscriptAvailableError):
+                    typer.echo("  Skipped: no transcript available")
+                    run_stats["skipped_no_transcript"] += 1
+                else:
+                    typer.echo(f"  FAILED: {exc}", err=True)
+                    run_stats["failed"] += 1
+                    run_stats["failed_sources"].append(source)
+
+    except KeyboardInterrupt:
+        interrupted = True
+        typer.echo("\nInterrupted — completed videos have been saved to the database.")
+
+    typer.echo()
+    typer.echo("=== Batch Summary ===")
+    if interrupted:
+        typer.echo("  (interrupted by user — completed videos preserved)")
+    if dry_run:
+        typer.echo("  (dry run — no changes written)")
+    typer.echo(f"  Attempted:        {run_stats['attempted']}")
+    typer.echo(f"  Inserted:         {run_stats['inserted']}")
+    typer.echo(f"  Skipped existing: {run_stats['skipped_existing']}")
+    typer.echo(f"  Skipped duration: {run_stats['skipped_duration']}")
+    typer.echo(f"  Skipped no transcript: {run_stats['skipped_no_transcript']}")
+    typer.echo(f"  Failed:           {run_stats['failed']}")
+    typer.echo(f"  New moments:      {run_stats['new_moments']}")
+    typer.echo(f"  New evidence:     {run_stats['new_evidence']}")
+    typer.echo(f"  New ideas:        {run_stats['new_ideas']}")
+    typer.echo(f"  Database:         {config.db_path}")
+
+    if run_stats["failed_sources"]:
+        typer.echo()
+        typer.echo("Failed sources:")
+        for s in run_stats["failed_sources"]:
+            typer.echo(f"  - {s}")
+
+
+# ----------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------
 
@@ -1602,3 +1887,220 @@ def _get_moment_count(config, video_id: str) -> int:
     from vidcrawl.db import get_db, get_moment_count_by_video
     with get_db(config.db_path) as conn:
         return get_moment_count_by_video(conn, video_id)
+
+
+def _collect_batch_sources(source_list: str) -> list[str]:
+    from vidcrawl.ingest.media import VALID_EXTENSIONS
+    p = Path(source_list)
+    if p.is_dir():
+        return [
+            str(f) for f in sorted(p.iterdir())
+            if f.is_file() and f.suffix.lower() in VALID_EXTENSIONS
+        ]
+    if p.is_file():
+        lines = p.read_text().splitlines()
+        return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+    raise FileNotFoundError(f"Source list not found: {source_list}")
+
+
+def _count_batch_rows(db_path, video_id: str) -> tuple[int, int, int]:
+    with get_db(db_path) as conn:
+        m = conn.execute(
+            "SELECT COUNT(*) FROM moments WHERE video_id = ?", (video_id,)
+        ).fetchone()[0]
+        ev = conn.execute(
+            "SELECT COUNT(*) FROM modal_evidence WHERE moment_id IN "
+            "(SELECT moment_id FROM moments WHERE video_id = ?)", (video_id,)
+        ).fetchone()[0]
+        ids = conn.execute(
+            "SELECT COUNT(*) FROM ideas WHERE moment_id IN "
+            "(SELECT moment_id FROM moments WHERE video_id = ?)", (video_id,)
+        ).fetchone()[0]
+    return m, ev, ids
+
+
+def _batch_ingest_youtube(
+    url: str,
+    video_id: str,
+    config,
+    process: bool,
+    download: bool,
+    max_duration_sec: Optional[float] = None,
+    meta_timeout_sec: float = 30.0,
+    download_timeout_sec: float = 600.0,
+    **txargs,
+) -> None:
+    from vidcrawl.ingest.downloader import (
+        download_youtube,
+        extract_youtube_metadata,
+        is_yt_dlp_available,
+    )
+
+    typer.echo("  Fetching metadata...")
+    meta: dict = {}
+    if is_yt_dlp_available():
+        meta = extract_youtube_metadata(url, timeout_sec=meta_timeout_sec)
+
+    title = meta.get("title", f"YouTube video {video_id}")
+    duration = float(meta.get("duration", 0))
+
+    if max_duration_sec is not None and duration > max_duration_sec:
+        raise _SkipDuration(
+            f"duration {duration:.0f}s exceeds --max-duration-sec {max_duration_sec:.0f}s"
+        )
+
+    video_metadata: dict = {}
+    if meta.get("description"):
+        video_metadata["description"] = meta["description"]
+    if meta.get("uploader"):
+        video_metadata["uploader"] = meta["uploader"]
+
+    video = Video(
+        video_id=video_id,
+        title=title,
+        source="youtube",
+        url=url,
+        duration_sec=duration,
+        status="pending",
+        metadata=video_metadata,
+    )
+    run_id = generate_run_id()
+    run = IngestionRun(
+        run_id=run_id,
+        video_id=video_id,
+        status="running",
+        pipeline_steps=["register_metadata"],
+    )
+
+    typer.echo("  Writing video record...")
+    with get_db(config.db_path) as conn:
+        init_db(conn)
+        existing = get_video(conn, video_id)
+        if existing is None:
+            insert_video(conn, video)
+        else:
+            conn.execute(
+                "UPDATE videos SET url = ? WHERE video_id = ?",
+                (url, video_id),
+            )
+        insert_ingestion_run(conn, run)
+
+    if process and download and is_yt_dlp_available():
+        from vidcrawl.ingest.media import VALID_EXTENSIONS
+        typer.echo("  Downloading video...")
+        download_dir = config.videos_dir / video_id
+        downloaded = download_youtube(
+            url, str(download_dir), video_id, timeout_sec=download_timeout_sec
+        )
+        if downloaded is None and download_dir.exists():
+            # yt-dlp may fail (network error, rate limit) even when a previous
+            # download succeeded. Fall back to the existing file so --force
+            # still triggers the full pipeline.
+            for f in sorted(download_dir.iterdir()):
+                if f.stem == video_id and f.is_file() and f.suffix.lower() in VALID_EXTENSIONS:
+                    downloaded = str(f)
+                    break
+        if downloaded:
+            from vidcrawl.process.pipeline import process_local_video
+            process_local_video(
+                downloaded, config, source_url=url,
+                video_id_override=video_id, **txargs
+            )
+    elif process and not download:
+        # Caption-only mode: fetch captions and process without a local video file.
+        # We create a zero-byte placeholder so process_local_video can resolve paths.
+        from vidcrawl.process.pipeline import NoTranscriptAvailableError, process_local_video
+        placeholder_dir = config.videos_dir / video_id
+        placeholder_dir.mkdir(parents=True, exist_ok=True)
+        placeholder = placeholder_dir / f"{video_id}.mp4"
+        if not placeholder.exists():
+            placeholder.write_bytes(b"")
+        _pref_captions = txargs.get("prefer_yt_captions", False)
+        _whisper_off = not txargs.get("allow_whisper", True)
+        process_local_video(
+            str(placeholder), config, source_url=url,
+            video_id_override=video_id,
+            raise_on_no_transcript=_pref_captions and _whisper_off,
+            **txargs
+        )
+
+
+def _batch_ingest_local(
+    path_str: str, video_id: str, config, process: bool, **txargs
+) -> None:
+    path = Path(path_str)
+    validate_video_file(str(path))
+
+    if process:
+        from vidcrawl.process.pipeline import process_local_video
+        process_local_video(str(path), config, **txargs)
+    else:
+        video = Video(
+            video_id=video_id,
+            title=path.stem,
+            source="local",
+            url=None,
+            duration_sec=0.0,
+            status="pending",
+        )
+        run_id = generate_run_id()
+        run = IngestionRun(
+            run_id=run_id,
+            video_id=video_id,
+            status="running",
+            pipeline_steps=["register_metadata"],
+        )
+        with get_db(config.db_path) as conn:
+            init_db(conn)
+            existing = get_video(conn, video_id)
+            if existing is None:
+                insert_video(conn, video)
+            else:
+                update_video_status(conn, video_id, "pending")
+            insert_ingestion_run(conn, run)
+
+
+# ----------------------------------------------------------------
+# server
+# ----------------------------------------------------------------
+
+@app.command()
+def server(
+    host: str = typer.Option(
+        "127.0.0.1", "--host",
+        help="Host to bind",
+    ),
+    port: int = typer.Option(
+        8765, "--port",
+        help="Port to bind",
+    ),
+    data_dir: str = typer.Option(
+        "data", "--data-dir", "-d",
+        help="Data directory path",
+    ),
+    reload: bool = typer.Option(
+        False, "--reload",
+        help="Enable auto-reload (development only)",
+    ),
+) -> None:
+    """Start the VidCrawl API server."""
+    try:
+        import uvicorn
+    except ImportError:
+        typer.echo(
+            "uvicorn is required to run the server. "
+            "Install it with: pip install uvicorn",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    from vidcrawl.api.app import create_app
+
+    config = get_config(data_dir)
+    config.ensure_dirs()
+
+    api = create_app(config)
+    typer.echo(f"VidCrawl API server starting on http://{host}:{port}")
+    typer.echo(f"  Data directory: {config.data_dir}")
+    typer.echo(f"  Database:       {config.db_path}")
+    uvicorn.run(api, host=host, port=port, reload=reload)

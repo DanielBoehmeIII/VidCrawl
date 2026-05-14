@@ -1,6 +1,7 @@
 import json
 import shutil
 import subprocess
+import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
@@ -9,7 +10,40 @@ def is_yt_dlp_available() -> bool:
     return shutil.which("yt-dlp") is not None
 
 
-def download_youtube(url: str, output_dir: str, video_id: str) -> Optional[str]:
+def normalize_youtube_url(url: str) -> str:
+    """Normalize a YouTube URL to https://www.youtube.com/watch?v=<id>.
+
+    Strips playlist, list, radio, start_radio, and all other extra params.
+    Returns url unchanged if it is not a recognizable YouTube video URL.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return url
+
+    netloc = parsed.netloc.lower()
+
+    if netloc in ("youtu.be", "www.youtu.be"):
+        video_id = parsed.path.lstrip("/").split("/")[0].split("?")[0]
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+        return url
+
+    if netloc in ("youtube.com", "www.youtube.com", "m.youtube.com"):
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+        video_ids = params.get("v")
+        if video_ids:
+            return f"https://www.youtube.com/watch?v={video_ids[0]}"
+
+    return url
+
+
+def download_youtube(
+    url: str,
+    output_dir: str,
+    video_id: str,
+    timeout_sec: float = 600.0,
+) -> Optional[str]:
     yt_dlp = shutil.which("yt-dlp")
     if not yt_dlp:
         return None
@@ -23,7 +57,7 @@ def download_youtube(url: str, output_dir: str, video_id: str) -> Optional[str]:
             [yt_dlp, "-f", "mp4", "-o", output_template, url],
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=timeout_sec,
         )
         if result.returncode != 0:
             return None
@@ -36,7 +70,10 @@ def download_youtube(url: str, output_dir: str, video_id: str) -> Optional[str]:
         return None
 
 
-def extract_youtube_metadata(url: str) -> dict[str, Any]:
+def extract_youtube_metadata(
+    url: str,
+    timeout_sec: float = 30.0,
+) -> dict[str, Any]:
     yt_dlp = shutil.which("yt-dlp")
     if not yt_dlp:
         return {}
@@ -46,7 +83,7 @@ def extract_youtube_metadata(url: str) -> dict[str, Any]:
             [yt_dlp, "--dump-json", "--no-download", url],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout_sec,
         )
         if result.returncode != 0:
             return {}

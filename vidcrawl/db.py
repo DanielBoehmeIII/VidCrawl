@@ -98,7 +98,6 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
     completed_at TEXT
 );
 
-DROP TABLE IF EXISTS moments_fts;
 CREATE VIRTUAL TABLE IF NOT EXISTS moments_fts USING fts5(
     moment_id UNINDEXED,
     transcript_text,
@@ -130,6 +129,16 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     _migrate_duplicates_schema(conn)
     _init_graph_tables(conn)
+    _maybe_rebuild_fts(conn)
+
+
+def _maybe_rebuild_fts(conn: sqlite3.Connection) -> None:
+    """Rebuild FTS if moments exist but FTS index is empty (e.g. after a fresh schema deploy)."""
+    fts_count = conn.execute("SELECT COUNT(*) FROM moments_fts").fetchone()[0]
+    if fts_count == 0:
+        moment_count = conn.execute("SELECT COUNT(*) FROM moments").fetchone()[0]
+        if moment_count > 0:
+            rebuild_fts(conn)
 
 
 def _init_graph_tables(conn: sqlite3.Connection) -> None:

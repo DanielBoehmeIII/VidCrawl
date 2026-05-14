@@ -1,5 +1,8 @@
 import json
 import re
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -142,6 +145,12 @@ def _parse_srt_timestamp(ts: str) -> float:
 
 
 def _parse_vtt_timestamp(ts: str) -> float:
+    # YouTube auto-captions append cue settings after the timestamp, e.g.
+    # "00:00:05.000 align:start position:0%". Take only the first token.
+    ts = ts.strip()
+    if not ts:
+        return 0.0
+    ts = ts.split()[0]
     ts = ts.replace(",", ".")
     parts = ts.split(":")
     if len(parts) == 3:
@@ -153,16 +162,12 @@ def _parse_vtt_timestamp(ts: str) -> float:
     return 0.0
 
 
-def transcribe_audio(audio_path: str, model_name: str = "base") -> list[dict]:
-    import shutil
-    whisper_bin = shutil.which("whisper")
-    if not whisper_bin:
-        import warnings
-        warnings.warn(
-            "Whisper not installed. Install with: pip install openai-whisper. "
-            "Skipping ASR transcription."
-        )
-        return []
+def transcribe_audio(
+    audio_path: str,
+    model_name: str = "tiny",
+    device: str = "auto",
+    timeout_sec: Optional[float] = None,
+) -> list[dict]:
     try:
         import whisper
     except ImportError:
@@ -174,8 +179,34 @@ def transcribe_audio(audio_path: str, model_name: str = "base") -> list[dict]:
         )
         return []
 
-    model = whisper.load_model(model_name)
-    result = model.transcribe(audio_path)
+    effective_device = _resolve_device(device)
+    fp16 = effective_device != "cpu"
+
+    print(
+        f"  Transcribing audio (model={model_name}, device={effective_device})...",
+        flush=True,
+    )
+
+    model = whisper.load_model(model_name, device=effective_device)
+
+    def _run() -> dict:
+        return model.transcribe(audio_path, fp16=fp16)
+
+    if timeout_sec is not None:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run)
+            try:
+                result = future.result(timeout=timeout_sec)
+            except concurrent.futures.TimeoutError:
+                import warnings
+                warnings.warn(
+                    f"Transcription timed out after {timeout_sec}s. Skipping ASR."
+                )
+                return []
+    else:
+        result = _run()
+
     segments = []
     for seg in result.get("segments", []):
         segments.append({
@@ -184,3 +215,54 @@ def transcribe_audio(audio_path: str, model_name: str = "base") -> list[dict]:
             "text": seg["text"].strip(),
         })
     return segments
+
+
+def _resolve_device(device: str) -> str:
+    if device in ("cpu", "cuda"):
+        return device
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
+def fetch_youtube_captions(
+    url: str,
+    timeout_sec: float = 60.0,
+) -> Optional[list[dict]]:
+    """Fetch YouTube auto-generated or manual captions via yt-dlp."""
+    import shutil
+    yt_dlp = shutil.which("yt-dlp")
+    if not yt_dlp:
+        return None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_template = str(Path(tmpdir) / "caption")
+        try:
+            subprocess.run(
+                [
+                    yt_dlp,
+                    "--write-auto-sub", "--write-sub",
+                    "--sub-lang", "en",
+                    "--skip-download",
+                    "--convert-subs", "vtt",
+                    "-o", output_template,
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except Exception:
+            return None
+
+        for f in sorted(Path(tmpdir).iterdir()):
+            if f.suffix in (".vtt", ".srt") and f.stat().st_size > 0:
+                try:
+                    raw = _parse_transcript_file(str(f), f.suffix)
+                    if raw:
+                        return raw
+                except Exception:
+                    continue
+    return None
