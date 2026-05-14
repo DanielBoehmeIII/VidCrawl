@@ -1,0 +1,71 @@
+import json
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any, Optional
+
+
+def is_yt_dlp_available() -> bool:
+    return shutil.which("yt-dlp") is not None
+
+
+def download_youtube(url: str, output_dir: str, video_id: str) -> Optional[str]:
+    yt_dlp = shutil.which("yt-dlp")
+    if not yt_dlp:
+        return None
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    output_template = str(out / f"{video_id}.%(ext)s")
+
+    try:
+        result = subprocess.run(
+            [yt_dlp, "-f", "mp4", "-o", output_template, url],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            return None
+
+        for f in out.iterdir():
+            if f.stem == video_id and f.is_file():
+                return str(f)
+        return None
+    except Exception:
+        return None
+
+
+def extract_youtube_metadata(url: str) -> dict[str, Any]:
+    yt_dlp = shutil.which("yt-dlp")
+    if not yt_dlp:
+        return {}
+
+    try:
+        result = subprocess.run(
+            [yt_dlp, "--dump-json", "--no-download", url],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return {}
+        return json.loads(result.stdout)
+    except Exception:
+        return {}
+
+
+def yt_dlp_install_help() -> str:
+    return (
+        "yt-dlp is not installed. YouTube download requires yt-dlp.\n"
+        "  Install: pip install yt-dlp\n"
+        "  Or:      apt install yt-dlp\n"
+        "Without yt-dlp, YouTube videos are registered as metadata only."
+    )
+
+
+def accept_local(path: str) -> str:
+    p = Path(path).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Local file not found: {p}")
+    return str(p)

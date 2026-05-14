@@ -1,0 +1,8 @@
+{
+  "queries": [
+    {"query": "npm install", "expected_terms": ["npm", "install"]},
+    {"query": "pip install", "expected_terms": ["pip", "install"]},
+    {"query": "page.goto", "expected_terms": ["page.goto"]},
+    {"query": "headless detection", "expected_terms": ["headless", "detection"]}
+  ]
+}

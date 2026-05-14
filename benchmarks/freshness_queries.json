@@ -1,0 +1,6 @@
+{
+  "queries": [
+    {"query": "tutorial", "expected_terms": ["tutorial"]},
+    {"query": "method", "expected_terms": ["method"]}
+  ]
+}

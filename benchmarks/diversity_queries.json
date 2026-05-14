@@ -1,0 +1,7 @@
+{
+  "queries": [
+    {"query": "playwright", "expected_terms": ["playwright"]},
+    {"query": "browser", "expected_terms": ["browser"]},
+    {"query": "attention", "expected_terms": ["attention"]}
+  ]
+}

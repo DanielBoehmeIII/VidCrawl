@@ -1,0 +1,14 @@
+{
+  "queries": [
+    {"query": "playwright browser", "expected_terms": ["playwright", "browser"], "expected_video_id": "demo_coding", "expected_moment_contains": "MCP"},
+    {"query": "install npm", "expected_terms": ["install"], "expected_video_id": "demo_coding"},
+    {"query": "warning headless", "expected_terms": ["warning", "headless"], "expected_video_id": "demo_coding"},
+    {"query": "transformer attention", "expected_terms": ["transformer", "attention"], "expected_video_id": "demo_ml"},
+    {"query": "user research interview", "expected_terms": ["user", "research"], "expected_video_id": "demo_ux"},
+    {"query": "comparison", "expected_terms": ["comparison"]},
+    {"query": "definition", "expected_terms": ["definition"]},
+    {"query": "step", "expected_terms": ["step"]},
+    {"query": "model architecture", "expected_terms": ["model", "architecture"], "expected_video_id": "demo_ml"},
+    {"query": "error handling", "expected_terms": ["error"]}
+  ]
+}
