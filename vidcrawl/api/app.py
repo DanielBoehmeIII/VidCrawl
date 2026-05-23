@@ -18,11 +18,15 @@ from vidcrawl.api.jobs import (
     init_jobs_table,
     list_jobs,
     update_job,
+    update_job_heartbeat,
+    update_job_progress,
 )
 from vidcrawl.config import Config
 from vidcrawl.db import (
     get_db,
     get_moment,
+    get_moment_count_by_video,
+    get_moments_by_video,
     get_video,
     init_db,
     list_videos,
@@ -90,6 +94,11 @@ class JobResponse(BaseModel):
     updated_at: str
     error_message: Optional[str] = None
     result: dict = {}
+    stage: str = ""
+    progress_message: str = ""
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    duration_ms: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +137,7 @@ def _ingest_worker(
     prefer_yt_captions: bool,
     allow_whisper: bool,
     transcribe_model: str,
+    mode: str = "full",
 ) -> None:
     """Runs in a thread — ingests one source and updates the job record."""
     from vidcrawl.ingest.providers.registry import get_provider
@@ -137,8 +147,42 @@ def _ingest_worker(
         ingest_any_source,
         process_local_video,
     )
+    import threading
+    import traceback
 
     db_path = config.db_path
+
+    def _try_set_error(msg: str) -> None:
+        try:
+            with get_db(db_path) as ec:
+                update_job(ec, job_id, "error", error_message=msg)
+                update_job_progress(ec, job_id, "error", msg)
+        except Exception:
+            pass
+
+    _heartbeat_stop = threading.Event()
+
+    def _heartbeat_loop():
+        while not _heartbeat_stop.is_set():
+            _heartbeat_stop.wait(30)
+            if _heartbeat_stop.is_set():
+                break
+            try:
+                with get_db(db_path) as hb_conn:
+                    update_job_heartbeat(hb_conn, job_id)
+            except Exception:
+                pass
+
+    try:
+        hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        hb_thread.start()
+    except Exception as exc:
+        _try_set_error(f"Failed to start heartbeat thread: {exc}")
+        return
+
+    def _cleanup():
+        _heartbeat_stop.set()
+        hb_thread.join(timeout=3)
 
     try:
         if source.startswith(("http://", "https://")):
@@ -148,43 +192,57 @@ def _ingest_worker(
 
             with get_db(db_path) as conn:
                 update_job(conn, job_id, "running", video_id=video_id)
+                update_job_progress(conn, job_id, "metadata", "Starting ingestion")
 
             if process:
                 ingest_any_source(
                     url, config,
                     allow_whisper=allow_whisper,
                     transcribe_model=transcribe_model,
+                    job_id=job_id,
+                    mode=mode,
                 )
 
         else:
-            # Local file
             path = Path(source)
             video_id = make_video_id("local", str(path.resolve()))
 
             with get_db(db_path) as conn:
                 update_job(conn, job_id, "running", video_id=video_id)
+                update_job_progress(conn, job_id, "metadata", "Starting ingestion")
 
             if process:
                 process_local_video(
                     str(path), config,
                     transcribe_model=transcribe_model,
                     allow_whisper=allow_whisper,
+                    job_id=job_id,
+                    mode=mode,
                 )
 
+        _cleanup()
         with get_db(db_path) as conn:
             update_job(conn, job_id, "ready", video_id=video_id)
 
     except NeedsTranscriptionError as exc:
+        _cleanup()
         with get_db(db_path) as conn:
             update_job(conn, job_id, "needs_transcription",
                        error_message=str(exc))
+            update_job_progress(conn, job_id, "needs_transcription", str(exc))
     except NoTranscriptAvailableError as exc:
+        _cleanup()
         with get_db(db_path) as conn:
             update_job(conn, job_id, "skipped_no_transcript",
                        error_message=str(exc))
+            update_job_progress(conn, job_id, "skipped_no_transcript", str(exc))
     except Exception as exc:
+        _cleanup()
+        tb = traceback.format_exc()
         with get_db(db_path) as conn:
-            update_job(conn, job_id, "error", error_message=str(exc))
+            update_job(conn, job_id, "error",
+                       error_message=f"{exc}\n{tb}")
+            update_job_progress(conn, job_id, "error", str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -247,12 +305,13 @@ def create_app(config: Config) -> FastAPI:
         }
 
     def _submit(job_id: str, source: str, req_process: bool, req_download: bool,
-                req_prefer_captions: bool, req_allow_whisper: bool, req_model: str) -> None:
+                req_prefer_captions: bool, req_allow_whisper: bool, req_model: str,
+                mode: str = "full") -> None:
         executor.submit(
             _ingest_worker,
             config, job_id, source,
             req_process, req_download, req_prefer_captions,
-            req_allow_whisper, req_model,
+            req_allow_whisper, req_model, mode,
         )
 
     # ----------------------------------------------------------------
@@ -387,7 +446,7 @@ def create_app(config: Config) -> FastAPI:
     # POST /clipbounce/capture
     # ----------------------------------------------------------------
 
-    def _capture_one(url_raw: str, allow_whisper: bool = False) -> JobResponse:
+    def _capture_one(url_raw: str, allow_whisper: bool = False, mode: str = "default") -> JobResponse:
         """Ingest a single URL and return a JobResponse (deduped)."""
         from vidcrawl.ingest.providers.registry import get_provider
 
@@ -429,7 +488,8 @@ def create_app(config: Config) -> FastAPI:
         with get_db(config.db_path) as conn:
             job_id = create_job(conn, url, video_id=video_id)
 
-        _submit(job_id, url, True, False, True, allow_whisper, "tiny")
+        actual_mode = "fast" if mode == "fast" else "full"
+        _submit(job_id, url, True, False, True, allow_whisper, "tiny", mode=actual_mode)
 
         with get_db(config.db_path) as conn:
             job = get_job(conn, job_id)
@@ -438,9 +498,9 @@ def create_app(config: Config) -> FastAPI:
     @app.post("/clipbounce/capture")
     def clipbounce_capture(req: CaptureRequest) -> Union[JobResponse, BatchCaptureResponse]:
         if req.sources is not None:
-            # Batch form: {"sources": [...], "mode": "captions_first"}
+            # Batch form: {"sources": [...], "mode": "fast"}
             jobs = [
-                _capture_one(src.url, allow_whisper=req.allow_whisper)
+                _capture_one(src.url, allow_whisper=req.allow_whisper, mode=req.mode)
                 for src in req.sources
                 if src.url.strip()
             ]
@@ -449,6 +509,237 @@ def create_app(config: Config) -> FastAPI:
         # Single-URL form
         if not req.url:
             raise HTTPException(status_code=422, detail="Either 'url' or 'sources' must be provided")
-        return _capture_one(req.url, allow_whisper=req.allow_whisper)
+        return _capture_one(req.url, allow_whisper=req.allow_whisper, mode=req.mode)
+
+    # ----------------------------------------------------------------
+    # GET /clipbounce/context
+    # ----------------------------------------------------------------
+
+    @app.get("/clipbounce/context")
+    def clipbounce_context(
+        url: str = Query(..., description="Source URL to look up"),
+        q: Optional[str] = Query(None, description="Prompt to score moments against"),
+    ):
+        from vidcrawl.ingest.providers.registry import get_provider
+        from vidcrawl.utils.time import timestamp_range
+        from vidcrawl.api.jobs import mark_stuck_jobs
+
+        # Normalize URL → video_id using the same path as /clipbounce/capture
+        provider = get_provider(url)
+        normalized_url = provider.normalize(url)
+        video_id = make_video_id(provider.source_type, normalized_url)
+
+        with get_db(config.db_path) as conn:
+            mark_stuck_jobs(conn)
+            video = get_video(conn, video_id)
+            job = find_job_by_url(conn, normalized_url)
+            moment_count = get_moment_count_by_video(conn, video_id)
+
+        # 404 only when the URL is completely unknown (no video, no job)
+        if video is None and job is None:
+            raise HTTPException(status_code=404, detail=f"Video not found for URL: {url}")
+
+        job_status = job["status"] if job else None
+        job_stage = job.get("stage", "") if job else ""
+        job_progress = job.get("progress_message", "") if job else ""
+
+        # If moments already exist, content is usable even if pipeline hasn't
+        # fully set video.status to "ready" (e.g. fast mode).
+        if moment_count > 0:
+            ctx_status = "ready"
+        elif job_status == "needs_transcription":
+            ctx_status = "needs_transcription"
+        elif job_status == "skipped_no_transcript":
+            ctx_status = "skipped_no_transcript"
+        elif job_status == "skipped":
+            ctx_status = "skipped"
+        elif job_status in ("error",) or (video and video.status == "error"):
+            video_err = video.error_message if video else ""
+            if video_err and "transcri" in video_err.lower():
+                ctx_status = "needs_transcription"
+            else:
+                ctx_status = "skipped"
+        else:
+            ctx_status = "indexing"
+
+        effective_url = (video.url if video and video.url else url)
+        title = video.title if video else normalized_url
+        job_id = job["job_id"] if job else None
+
+        base = {
+            "video_id": video_id,
+            "title": title,
+            "url": effective_url,
+            "status": ctx_status,
+            "job_id": job_id,
+            "stage": job_stage,
+            "progress_message": job_progress,
+        }
+
+        if moment_count == 0:
+            return {**base, "moments": [], "ideas": []}
+
+        with get_db(config.db_path) as conn:
+            all_moments = get_moments_by_video(conn, video_id)
+
+        def _to_ctx(m, score: float = 0.0) -> dict:
+            idea_parts = [f"[{i.type}] {i.text[:80]}" for i in m.ideas[:3]]
+            return {
+                "timestamp_label": timestamp_range(m.start_sec, m.end_sec),
+                "transcript_snippet": (m.transcript_text or "")[:240],
+                "idea_summary": "; ".join(idea_parts),
+                "score": round(score, 4),
+            }
+
+        selected_pairs: list[tuple[dict, str]] = []
+        selected_ids: set[str] = set()
+
+        # Top 5 by relevance when q is given
+        if q and q.strip():
+            from vidcrawl.search.query import search_moments
+            sr = search_moments(q, config.db_path, limit=5, video_id=video_id, use_rerank=True)
+            for r in sr:
+                if r.moment_id not in selected_ids:
+                    selected_pairs.append(({
+                        "timestamp_label": r.timestamp_label,
+                        "transcript_snippet": r.transcript_snippet,
+                        "idea_summary": r.idea_summary,
+                        "score": round(r.score, 4),
+                    }, r.moment_id))
+                    selected_ids.add(r.moment_id)
+
+        # 3 timeline anchors (evenly spaced across the moments list)
+        n = len(all_moments)
+        if n >= 3:
+            anchor_indices = [n // 4, n // 2, 3 * n // 4]
+        elif n == 2:
+            anchor_indices = [0, 1]
+        else:
+            anchor_indices = [0]
+
+        for idx in anchor_indices:
+            m = all_moments[idx]
+            if m.moment_id not in selected_ids:
+                selected_pairs.append((_to_ctx(m, score=0.5), m.moment_id))
+                selected_ids.add(m.moment_id)
+
+        if not selected_pairs:
+            for m in all_moments[:5]:
+                if m.moment_id not in selected_ids:
+                    selected_pairs.append((_to_ctx(m, score=0.5), m.moment_id))
+                    selected_ids.add(m.moment_id)
+
+        mid_to_moment = {m.moment_id: m for m in all_moments}
+        ideas: list[str] = []
+        seen_ideas: set[str] = set()
+        for _, mid in selected_pairs:
+            m = mid_to_moment.get(mid)
+            if m:
+                for idea in m.ideas:
+                    text = f"[{idea.type}] {idea.text}"
+                    if text not in seen_ideas:
+                        seen_ideas.add(text)
+                        ideas.append(text)
+
+        return {
+            **base,
+            "status": "ready",
+            "moments": [ctx for ctx, _ in selected_pairs],
+            "ideas": ideas,
+        }
+
+    # ----------------------------------------------------------------
+    # GET /clipbounce/jobs
+    # ----------------------------------------------------------------
+
+    @app.get("/clipbounce/jobs", response_model=JobResponse)
+    def clipbounce_jobs(
+        url: str = Query(..., description="Source URL to look up the job for"),
+    ):
+        from vidcrawl.ingest.providers.registry import get_provider
+
+        provider = get_provider(url)
+        normalized_url = provider.normalize(url)
+
+        with get_db(config.db_path) as conn:
+            job = find_job_by_url(conn, normalized_url)
+
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"No job found for URL: {url}")
+
+        return JobResponse(**job)
+
+    # ----------------------------------------------------------------
+    # GET /debug/clipbounce-flow
+    # ----------------------------------------------------------------
+
+    @app.get("/debug/clipbounce-flow")
+    def debug_clipbounce_flow(
+        url: str = Query(..., description="Source URL to diagnose"),
+    ):
+        from vidcrawl.ingest.providers.registry import get_provider
+        from vidcrawl.process.chunking import chunk_transcript
+
+        provider = get_provider(url)
+        normalized_url = provider.normalize(url)
+        video_id = make_video_id(provider.source_type, normalized_url)
+
+        with get_db(config.db_path) as conn:
+            video = get_video(conn, video_id)
+            job = find_job_by_url(conn, normalized_url)
+            moment_count = get_moment_count_by_video(conn, video_id)
+
+        diagnostic = {
+            "video_id": video_id,
+            "url": normalized_url,
+        }
+
+        if video:
+            diagnostic["video"] = {
+                "status": video.status,
+                "duration_sec": video.duration_sec,
+                "error_message": video.error_message,
+                "created_at": video.created_at,
+            }
+        else:
+            diagnostic["video"] = None
+
+        if job:
+            diagnostic["job"] = {
+                "job_id": job["job_id"],
+                "status": job["status"],
+                "stage": job.get("stage", ""),
+                "progress_message": job.get("progress_message", ""),
+                "last_heartbeat_at": job.get("last_heartbeat_at"),
+                "started_at": job.get("started_at"),
+                "finished_at": job.get("finished_at"),
+                "duration_ms": job.get("duration_ms"),
+                "error_message": job.get("error_message"),
+                "created_at": job.get("created_at"),
+                "updated_at": job.get("updated_at"),
+            }
+        else:
+            diagnostic["job"] = None
+
+        # Always attempt to check captions availability
+        captions_found = 0
+        transcript_count = 0
+        chunks_count = 0
+        try:
+            caps = provider.fetch_captions(normalized_url, timeout_sec=15.0)
+            if caps:
+                captions_found = len(caps)
+                chunks = chunk_transcript(caps)
+                chunks_count = len(chunks) if chunks else 0
+                transcript_count = len(caps)
+        except Exception as exc:
+            diagnostic["captions_error"] = str(exc)
+        diagnostic["captions_found"] = captions_found
+        diagnostic["transcript_segments"] = transcript_count
+        diagnostic["chunks_possible"] = chunks_count
+
+        diagnostic["moments_count"] = moment_count
+
+        return diagnostic
 
     return app

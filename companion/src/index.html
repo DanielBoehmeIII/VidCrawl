@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VidCrawl Companion</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <header>
+    <h1>VidCrawl Companion</h1>
+    <span class="subtitle">Local API server for ClipBounce</span>
+  </header>
+
+  <!-- Status -->
+  <section class="card">
+    <div class="status-grid">
+      <span class="label">Status</span>
+      <span class="status-pill">
+        <span id="status-dot" class="dot offline"></span>
+        <span id="status-text">Offline</span>
+      </span>
+
+      <span class="label">Endpoint</span>
+      <code id="endpoint">http://127.0.0.1:8765</code>
+    </div>
+  </section>
+
+  <!-- Actions -->
+  <div class="actions">
+    <button id="btn-start" class="primary" onclick="startServer()">Start Server</button>
+    <button id="btn-stop"  class="danger"  onclick="stopServer()"   disabled>Stop Server</button>
+    <button id="btn-data"                  onclick="openDataFolder()">Open Data Folder</button>
+  </div>
+
+  <!-- Config -->
+  <section class="card">
+    <h2>Configuration</h2>
+    <div class="config-grid">
+      <label for="cfg-port">Port</label>
+      <input type="number" id="cfg-port" value="8765" min="1024" max="65535" />
+
+      <label for="cfg-data-dir">Data Directory</label>
+      <input type="text" id="cfg-data-dir" value="data" placeholder="data" />
+
+      <label for="cfg-project-dir">Project Directory</label>
+      <input type="text" id="cfg-project-dir" placeholder="/path/to/VidCrawl" />
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-auto-start" />
+      <label for="cfg-auto-start">Auto-start server on launch</label>
+    </div>
+    <div class="config-footer">
+      <button onclick="saveConfig()">Save Config</button>
+      <span id="save-msg" class="save-msg"></span>
+    </div>
+  </section>
+
+  <!-- ── Dashboard (stats bar) ── -->
+  <section class="card api-section" id="dashboard-card" style="display:none">
+    <div class="section-hdr">
+      <h2>Dashboard</h2>
+      <button class="btn-sm" onclick="refreshDashboard()" title="Refresh stats">↻</button>
+    </div>
+    <div class="stats-bar">
+      <div class="stat-chip">
+        <span class="stat-value" id="stat-videos">—</span>
+        <span class="stat-label">videos</span>
+      </div>
+      <div class="stat-chip">
+        <span class="stat-value" id="stat-moments">—</span>
+        <span class="stat-label">moments</span>
+      </div>
+      <div class="stat-chip">
+        <span class="stat-value" id="stat-ideas">—</span>
+        <span class="stat-label">ideas</span>
+      </div>
+      <div class="stat-chip">
+        <span class="stat-value" id="stat-keyframes">—</span>
+        <span class="stat-label">keyframes</span>
+      </div>
+      <div class="stat-chip">
+        <span class="stat-value" id="stat-fts">—</span>
+        <span class="stat-label">indexed</span>
+      </div>
+      <div class="stat-chip">
+        <span class="stat-value" id="stat-jobs">—</span>
+        <span class="stat-label">jobs</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Video Library ── -->
+  <details class="card api-section" id="library-section" style="display:none">
+    <summary class="section-summary">
+      <h2>Library</h2>
+      <span id="library-count" class="count-pill"></span>
+      <button class="btn-sm" onclick="event.preventDefault(); loadLibrary()" title="Refresh">↻</button>
+    </summary>
+    <div class="lib-controls">
+      <input type="text" id="lib-filter" placeholder="Filter by title…" oninput="filterLibrary()" />
+      <div class="lib-status-tabs">
+        <button class="tab-btn active" data-filter="all"     onclick="setLibTab(this,'all')">All</button>
+        <button class="tab-btn"        data-filter="ready"   onclick="setLibTab(this,'ready')">Ready</button>
+        <button class="tab-btn"        data-filter="pending" onclick="setLibTab(this,'ingesting')">Active</button>
+        <button class="tab-btn"        data-filter="error"   onclick="setLibTab(this,'error')">Error</button>
+      </div>
+    </div>
+    <div id="library-list" class="lib-list"></div>
+  </details>
+
+  <!-- ── Job Queue ── -->
+  <details class="card api-section" id="queue-section" style="display:none">
+    <summary class="section-summary">
+      <h2>Job Queue</h2>
+      <span id="queue-active-count" class="count-pill count-pill-active"></span>
+      <button class="btn-sm" onclick="event.preventDefault(); loadQueue()" title="Refresh">↻</button>
+    </summary>
+    <div id="queue-list" class="queue-list"></div>
+  </details>
+
+  <!-- ── Search / Retrieval Tester ── -->
+  <details class="card api-section" id="search-section" style="display:none">
+    <summary class="section-summary">
+      <h2>Search</h2>
+      <span class="section-hint">retrieval tester</span>
+    </summary>
+    <div class="search-controls">
+      <input type="text" id="search-q" placeholder="Search moments…"
+             onkeydown="if(event.key==='Enter') runSearch()" />
+      <input type="text" id="search-video-id" placeholder="video_id (optional)" style="flex:0 0 160px" />
+      <button onclick="runSearch()">Search</button>
+    </div>
+    <div id="search-status" class="search-status"></div>
+    <div id="search-results" class="search-results"></div>
+  </details>
+
+  <!-- Logs -->
+  <section class="card">
+    <div class="log-header">
+      <h2>Server Output</h2>
+      <button class="btn-clear" onclick="clearLogs()">Clear</button>
+    </div>
+    <div id="log-panel" class="log-panel" role="log" aria-live="polite"></div>
+  </section>
+
+  <script src="main.js"></script>
+</body>
+</html>

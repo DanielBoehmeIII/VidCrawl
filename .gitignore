@@ -12,3 +12,42 @@ vidcrawl.db
 .venv/
 sources.txt
 big_sources.txt
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Rust / Tauri build output
+target/
+companion/src-tauri/target/
+
+# VidCrawl generated media/data
+data/videos/
+data/audio/
+data/frames/
+data/keyframes/
+data/downloads/
+data/cache/
+outputs/
+cache/
+
+# Databases / local runtime state
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Node
+node_modules/
+companion/node_modules/
+
+# Rust build output
+target/
+**/target/
+
+# Local Claude settings
+.claude/
+**/.claude/

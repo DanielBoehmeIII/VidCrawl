@@ -64,6 +64,8 @@ def process_local_video(
     video_id_override: Optional[str] = None,
     raise_on_no_transcript: bool = False,
     preloaded_transcript: Optional[list[dict]] = None,
+    job_id: Optional[str] = None,
+    mode: str = "full",
 ) -> str:
     path = Path(video_path).resolve()
     video_id = video_id_override or make_video_id("local", str(path))
@@ -131,16 +133,24 @@ def process_local_video(
                 source_url=source_url,
                 raise_on_no_transcript=raise_on_no_transcript,
                 preloaded_transcript=preloaded_transcript,
+                job_id=job_id,
+                mode=mode,
             )
         except NoTranscriptAvailableError:
             update_video_status(conn, video_id, "pending")
             complete_ingestion_run(conn, run_id, "failed", "no transcript available")
             conn.commit()
+            if job_id:
+                from vidcrawl.api.jobs import update_job_progress
+                update_job_progress(conn, job_id, "skipped_no_transcript", "No transcript available")
             raise
         except Exception as exc:
             update_video_status(conn, video_id, "error", str(exc))
             complete_ingestion_run(conn, run_id, "failed", str(exc))
             conn.commit()
+            if job_id:
+                from vidcrawl.api.jobs import update_job_progress
+                update_job_progress(conn, job_id, "error", str(exc))
             raise
 
     return video_id
@@ -183,8 +193,17 @@ def _run_pipeline(
     source_url: Optional[str] = None,
     raise_on_no_transcript: bool = False,
     preloaded_transcript: Optional[list[dict]] = None,
+    job_id: Optional[str] = None,
+    mode: str = "full",
 ) -> None:
     video_id = video.video_id
+
+    def _progress(stage, msg):
+        if job_id:
+            from vidcrawl.api.jobs import update_job_progress
+            update_job_progress(conn, job_id, stage, msg)
+
+    _progress("metadata", "Registering metadata and loading transcript")
 
     if preloaded_transcript is not None:
         transcript_entries: Optional[list[dict]] = preloaded_transcript
@@ -238,14 +257,23 @@ def _run_pipeline(
     if raise_on_no_transcript and not transcript_entries:
         raise NoTranscriptAvailableError("no transcript available")
 
+    _progress("captions", f"Loaded {len(transcript_entries) if transcript_entries else 0} captions")
+
     print("  [chunking] Chunking transcript...", flush=True)
     chunks = chunk_transcript(transcript_entries) if transcript_entries else []
+
     if chunks:
         steps.append("chunk_transcript")
         print(f"  [chunking] {len(chunks)} chunk(s).", flush=True)
+    elif transcript_entries is not None and len(transcript_entries) > 0:
+        raise RuntimeError(
+            f"Transcript has {len(transcript_entries)} segments but chunking produced 0 chunks"
+        )
     else:
         chunks = _create_fallback_chunks(video.duration_sec, video_id)
         print(f"  [chunking] Using {len(chunks)} fallback chunk(s).", flush=True)
+
+    _progress("chunking", f"Created {len(chunks)} chunks")
 
     if video.duration_sec <= 0:
         inferred = 0.0
@@ -262,29 +290,37 @@ def _run_pipeline(
                 (inferred, video_id),
             )
 
-    kf_dir = config.frames_dir / video_id
-    kf_dir.mkdir(parents=True, exist_ok=True)
+    is_fast = mode == "fast"
 
-    keyframes = extract_keyframes(
-        str(video_path),
-        str(kf_dir),
-        interval_sec=30.0,
-        video_duration=video.duration_sec if video.duration_sec > 0 else None,
-    )
-    if keyframes:
-        steps.append("extract_keyframes")
-        for kf in keyframes:
-            kf_record = Keyframe(
-                keyframe_id=generate_keyframe_id(),
-                video_id=video_id,
-                timestamp_sec=kf["timestamp_sec"],
-                file_path=kf["path"],
-            )
-            insert_keyframe(conn, kf_record)
+    if is_fast:
+        keyframes = []
+        ocr_results = []
+    else:
+        kf_dir = config.frames_dir / video_id
+        kf_dir.mkdir(parents=True, exist_ok=True)
 
-    ocr_results = ocr_frames(keyframes)
-    if ocr_results:
-        steps.append("ocr_frames")
+        keyframes = extract_keyframes(
+            str(video_path),
+            str(kf_dir),
+            interval_sec=30.0,
+            video_duration=video.duration_sec if video.duration_sec > 0 else None,
+        )
+        if keyframes:
+            steps.append("extract_keyframes")
+            for kf in keyframes:
+                kf_record = Keyframe(
+                    keyframe_id=generate_keyframe_id(),
+                    video_id=video_id,
+                    timestamp_sec=kf["timestamp_sec"],
+                    file_path=kf["path"],
+                )
+                insert_keyframe(conn, kf_record)
+
+        ocr_results = ocr_frames(keyframes)
+        if ocr_results:
+            steps.append("ocr_frames")
+
+    _progress("writing_db", f"Writing {len(chunks)} moment(s)")
 
     print(f"  [db] Writing {len(chunks)} moment(s)...", flush=True)
     moments = []
@@ -292,23 +328,29 @@ def _run_pipeline(
         moment_id = make_moment_id(video_id, chunk["start_sec"], chunk["end_sec"])
         transcript_text = chunk.get("transcript_text", "")
 
-        ocr_text, ocr_ideas = _get_ocr_for_moment(ocr_results, chunk)
-        chunk_ideas = extract_ideas(transcript_text) if transcript_text else []
-        chunk_ideas.extend(ocr_ideas)
+        if is_fast:
+            ocr_text = ""
+            ocr_ideas = []
+            chunk_ideas = []
+            kf_paths = []
+        else:
+            ocr_text, ocr_ideas = _get_ocr_for_moment(ocr_results, chunk)
+            chunk_ideas = extract_ideas(transcript_text) if transcript_text else []
+            chunk_ideas.extend(ocr_ideas)
+            kf_paths = _get_keyframes_for_moment(keyframes, chunk)
 
         idea_models = []
-        for idx, idea_dict in enumerate(chunk_ideas):
-            idea = Idea(
-                idea_id=make_idea_id(moment_id, idx),
-                moment_id=moment_id,
-                type=idea_dict["idea_type"],
-                text=idea_dict["text"],
-                confidence=idea_dict.get("confidence", 0.7),
-                source=idea_dict.get("source", "rule"),
-            )
-            idea_models.append(idea)
-
-        kf_paths = _get_keyframes_for_moment(keyframes, chunk)
+        if not is_fast:
+            for idx, idea_dict in enumerate(chunk_ideas):
+                idea = Idea(
+                    idea_id=make_idea_id(moment_id, idx),
+                    moment_id=moment_id,
+                    type=idea_dict["idea_type"],
+                    text=idea_dict["text"],
+                    confidence=idea_dict.get("confidence", 0.7),
+                    source=idea_dict.get("source", "rule"),
+                )
+                idea_models.append(idea)
 
         moment = Moment(
             moment_id=moment_id,
@@ -323,8 +365,9 @@ def _run_pipeline(
         insert_moment(conn, moment)
         moments.append(moment)
 
-        for idea in idea_models:
-            insert_idea(conn, idea)
+        if not is_fast:
+            for idea in idea_models:
+                insert_idea(conn, idea)
 
     if moments:
         steps.append("insert_moments")
@@ -332,13 +375,16 @@ def _run_pipeline(
         for moment in moments:
             _insert_evidence_for_moment(conn, moment, chunk_map={
                 m.moment_id: c for m, c in zip(moments, chunks)
-            }, ocr_results=ocr_results, keyframes=keyframes)
+            }, ocr_results=ocr_results, keyframes=keyframes,
+                skip_enrichment=is_fast)
 
     rebuild_fts(conn)
     steps.append("rebuild_fts")
 
     update_video_status(conn, video_id, "ready")
     complete_ingestion_run(conn, run_id, "completed")
+
+    _progress("ready", "Video ready")
 
     run = conn.execute(
         "SELECT * FROM ingestion_runs WHERE run_id = ?", (run_id,)
@@ -443,6 +489,7 @@ def _insert_evidence_for_moment(
     chunk_map: dict[str, dict],
     ocr_results: list[dict],
     keyframes: list[dict],
+    skip_enrichment: bool = False,
 ) -> None:
     chunk = chunk_map.get(moment.moment_id, {})
 
@@ -458,6 +505,9 @@ def _insert_evidence_for_moment(
                 source="sidecar" if chunk.get("source") != "asr" else "whisper",
             ),
         )
+
+    if skip_enrichment:
+        return
 
     ocr_for_moment = [
         o for o in ocr_results
@@ -527,6 +577,8 @@ def ingest_any_source(
     download_timeout_sec: float = 600.0,
     force: bool = False,
     run_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+    mode: str = "full",
 ) -> str:
     """Ingest any source (URL or local file) via automatic provider detection.
 
@@ -557,6 +609,8 @@ def ingest_any_source(
             transcribe_device=transcribe_device,
             transcribe_timeout_sec=transcribe_timeout_sec,
             video_id_override=video_id,
+            job_id=job_id,
+            mode=mode,
         )
 
     # URL-based source: try provider captions first (fast path, no download).
@@ -569,9 +623,15 @@ def ingest_any_source(
             source, provider, video_id, config,
             preloaded_transcript=captions,
             run_id=run_id,
+            job_id=job_id,
+            mode=mode,
         )
 
     # No captions available.
+    if mode == "fast":
+        raise NoTranscriptAvailableError(
+            f"No captions found for {source!r} in fast mode."
+        )
     if not allow_whisper:
         raise NeedsTranscriptionError(
             f"No captions found for {source!r}. "
@@ -585,6 +645,8 @@ def ingest_any_source(
             source, provider, video_id, config,
             preloaded_transcript=cached_transcript,
             run_id=run_id,
+            job_id=job_id,
+            mode=mode,
         )
 
     audio_path = provider.download_audio(
@@ -619,6 +681,8 @@ def ingest_any_source(
         preloaded_transcript=segments,
         audio_path=audio_path,
         run_id=run_id,
+        job_id=job_id,
+        mode=mode,
     )
 
 
@@ -630,6 +694,8 @@ def _ingest_url_with_transcript(
     preloaded_transcript: list[dict],
     audio_path: Optional[str] = None,
     run_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+    mode: str = "full",
 ) -> str:
     """Write metadata, create a local path, then run the pipeline."""
     from vidcrawl.db import get_db, init_db, insert_video
@@ -680,4 +746,6 @@ def _ingest_url_with_transcript(
         video_id_override=video_id,
         preloaded_transcript=preloaded_transcript,
         allow_whisper=False,
+        job_id=job_id,
+        mode=mode,
     )

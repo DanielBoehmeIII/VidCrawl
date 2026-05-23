@@ -1,0 +1,11 @@
+[package]
+name = "vidcrawl-companion-core"
+version = "0.1.0"
+edition = "2021"
+
+# No Tauri / GTK dependency — pure Rust + serde only.
+# Tests run without system GUI libraries.
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
